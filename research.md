@@ -1,2277 +1,1963 @@
-# Tegra-J: A Java 21 Implementation of TEGRA for Apache-Grade Open Source Graph Analytics
+# Tegra-J: Implementation Research Document
 
-## Research & Implementation Proposal
-
-**Based on:** *TEGRA: Efficient Ad-Hoc Analytics on Evolving Graphs* (Iyer et al., NSDI 2021)
-**Target Runtime:** Java 21+ (LTS)
-**License Model:** Apache License 2.0
-**Project Codename:** Tegra-J (working title; final ASF name TBD upon incubation)
+**Paper**: TEGRA: Efficient Ad-Hoc Analytics on Evolving Graphs
+**Authors**: Anand Padmanabha Iyer, Qifan Pu, Kishan Patel, Joseph E. Gonzalez, Ion Stoica
+**Venue**: NSDI 2021 (18th USENIX Symposium on Networked Systems Design and Implementation)
+**Target**: Java 21, Gradle multi-module, Apache-grade OSS
 
 ---
 
-## Table of Contents
+## 1. Paper Synopsis
 
-1. [Executive Summary](#1-executive-summary)
-2. [Deep Analysis of the Tegra Paper](#2-deep-analysis-of-the-tegra-paper)
-3. [Why Java 21](#3-why-java-21)
-4. [System Architecture for Tegra-J](#4-system-architecture-for-tegra-j)
-5. [Module Structure & Project Layout](#5-module-structure--project-layout)
-6. [Component 1: Persistent Data Structures (tegra-pds)](#6-component-1-persistent-data-structures-tegra-pds)
-7. [Component 2: DGSI — Distributed Graph Snapshot Index (tegra-store)](#7-component-2-dgsi--distributed-graph-snapshot-index-tegra-store)
-8. [Component 3: Timelapse API (tegra-api)](#8-component-3-timelapse-api-tegra-api)
-9. [Component 4: ICE Computation Engine (tegra-compute)](#9-component-4-ice-computation-engine-tegra-compute)
-10. [Component 5: Distribution Layer (tegra-cluster)](#10-component-5-distribution-layer-tegra-cluster)
-11. [Component 6: Serialization & Disk Eviction (tegra-serde)](#11-component-6-serialization--disk-eviction-tegra-serde)
-12. [GAS Engine & Built-in Algorithms (tegra-algorithms)](#12-gas-engine--built-in-algorithms-tegra-algorithms)
-13. [Memory Management Strategy](#13-memory-management-strategy)
-14. [Java 21 Feature Utilization Map](#14-java-21-feature-utilization-map)
-15. [API Design — The Public Contract](#15-api-design--the-public-contract)
-16. [Integration Points & Ecosystem](#16-integration-points--ecosystem)
-17. [Testing Strategy](#17-testing-strategy)
-18. [Benchmarking & Evaluation Plan](#18-benchmarking--evaluation-plan)
-19. [Phased Implementation Roadmap](#19-phased-implementation-roadmap)
-20. [OSS Project Governance & Community](#20-oss-project-governance--community)
-21. [Risk Analysis & Mitigations](#21-risk-analysis--mitigations)
-22. [Appendix A: Key Data Structure Pseudocode](#appendix-a-key-data-structure-pseudocode)
-23. [Appendix B: API Surface Draft](#appendix-b-api-surface-draft)
-24. [Appendix C: Comparison with Existing Java Graph Libraries](#appendix-c-comparison-with-existing-java-graph-libraries)
+Tegra is a system that enables efficient ad-hoc window operations on time-evolving graphs. It solves the problem of performing ad-hoc queries on arbitrary time windows — past, present, or sliding — without either storing full copies of every snapshot (prohibitive memory) or reconstructing from change logs (prohibitive latency).
+
+The system rests on two key insights about real-world evolving graph workloads:
+
+1. During ad-hoc analysis, graphs change slowly over time relative to their size.
+2. Queries are frequently applied to multiple windows relatively close by in time.
+
+Tegra exploits these by combining **persistent data structures** (structural sharing across graph versions for storage efficiency) with **incremental computation** (reusing intermediate results across snapshots for compute efficiency). It achieves up to 30x speedup over state-of-the-art systems for ad-hoc window operation workloads.
+
+### Three Core Components
+
+| Component | Paper Section | Purpose |
+|-----------|--------------|---------|
+| **Timelapse** | §3 | User-facing abstraction: evolving graph as a sequence of immutable snapshots |
+| **ICE** | §4 | Incremental Computation by Entity Expansion: GAS-based incremental model |
+| **DGSI** | §5 | Distributed Graph Snapshot Index: versioned graph store using persistent data structures |
+
+### What This Document Covers
+
+This document specifies a **faithful reimplementation** of the Tegra system in Java 21. Every component, API, and behavior described in the paper is mapped to a concrete implementation plan. Nothing is added beyond what the paper specifies. Potential improvements are documented separately in `future-improvements.md`.
 
 ---
 
-## 1. Executive Summary
+## 2. System Architecture
 
-This document proposes a ground-up Java 21 implementation of the Tegra system described in the NSDI 2021 paper by Iyer et al. from UC Berkeley RISE Lab and Microsoft Research. Tegra addresses a critical gap in evolving graph analytics: the ability to perform **ad-hoc queries on arbitrary time windows** of a changing graph without full recomputation or prohibitive storage overhead.
-
-The original Tegra was built on Apache Spark/GraphX in Scala. Our proposal, **Tegra-J**, is a standalone, dependency-minimal Java 21 implementation designed from the ground up to:
-
-1. **Leverage Java 21's modern features** — virtual threads, sealed interfaces, records, Foreign Memory API, structured concurrency — to eliminate the GC concerns raised about JVM-based implementations while delivering performance competitive with native implementations.
-
-2. **Be architected for open-source success** — clean module boundaries via JPMS, SPI-based extension points, Apache TinkerPop compatibility, and a layered API that serves both embedded single-node and distributed cluster deployments.
-
-3. **Improve upon the original design** where the paper acknowledges limitations — specifically around purely streaming workloads (15% tree overhead), the switching heuristic (random forest classifier), and the tight coupling to Spark's execution model.
-
-The core technical insight we preserve: **persistent data structures** (structural sharing across graph versions) combined with **incremental computation** (reusing intermediate results across snapshots) enables orders-of-magnitude improvement for ad-hoc temporal graph analytics.
-
-Our implementation targets:
-- **10M+ vertices, 1B+ edges** per node with 1000+ concurrent snapshots
-- **Sub-second snapshot retrieval** (matching Tegra's 1-2s on Twitter/UK graphs)
-- **18-30x speedup** on ad-hoc window operations vs. full recomputation (matching paper results)
-- **Zero-copy snapshot access** via off-heap persistent data structures
-
----
-
-## 2. Deep Analysis of the Tegra Paper
-
-### 2.1 Problem Statement
-
-Real-world graphs evolve continuously. Existing systems fall into silos:
-- **Static graph engines** (GraphX, Pregel, PowerGraph): process one snapshot at a time, no temporal awareness.
-- **Streaming engines** (Differential Dataflow, GraphBolt, Kineograph): keep a running query updated on the live graph, but cannot do ad-hoc historical queries.
-- **Temporal engines** (Chronos, ImmortalGraph): optimized for sequential scans over a known time range, but require expensive preprocessing and cannot update results.
-
-None support **ad-hoc window operations** — queries on arbitrary, non-predetermined, discontinuous time windows with computation reuse across windows.
-
-### 2.2 Tegra's Three Pillars
-
-#### Pillar 1: Timelapse Abstraction (Section 3 of paper)
-
-Timelapse presents the evolving graph as a sequence of **immutable static snapshots**. This is both a user abstraction and a system optimization opportunity:
-
-- **User perspective**: Work with familiar static graph APIs; time is just another dimension for retrieval.
-- **System perspective**: Immutability enables concurrent access without locking, and the sequence structure enables incremental computation.
-
-Key API operations: `save(id)`, `retrieve(id)`, `diff(snap, snap)`, `expand(candidates)`, `merge(snap, snap, func)`.
-
-Critical insight from paper Section 3.1: By exposing entity lineage (the history of a vertex/edge across snapshots), graph-parallel phases can operate on the *evolution* of an entity rather than a single snapshot value, eliminating redundant messages. The paper demonstrates 5 out of 11 messages being duplicates in a simple degree computation across 3 snapshots (Figure 2).
-
-#### Pillar 2: DGSI — Distributed Graph Snapshot Index (Section 5 of paper)
-
-DGSI is the storage backbone. Three critical design decisions:
-
-1. **Persistent Adaptive Radix Tree (pART)**: The paper reimplements PART in Scala with optimizations for graph storage. ART provides O(k) lookup (k = key length, not N), efficient range scans (important for edge retrieval by source vertex), and cache-friendly traversal. Path-copying adds persistence: modifying a leaf copies only O(log_256 n) ancestor nodes.
-
-2. **Dual-tree storage**: Each partition stores a **vertex pART** (keyed by 64-bit vertex ID) and an **edge pART** (keyed by composite byte array: src + dst + discriminator). Prefix matching on edge keys retrieves all outgoing edges of a vertex — this is essential for the GAS gather phase.
-
-3. **Version management via root pairs**: Every "version" (snapshot) is simply a pair of roots (vertex root, edge root) in the version map. Retrieval is a pointer lookup + tree traversal — O(1) to find the root, then O(key length) per entity access. This explains the sub-second retrieval (Table 3 in paper: TEGRA 1.34s vs. DD 30.2s for 200 snapshots of the Twitter graph).
-
-**Memory management** (Section 5.4): LRU eviction writes version-specific subtrees to disk files. Shared nodes across versions share files. Only active snapshots are fully materialized in memory. The paper demonstrates storing 1000 snapshots of the UK graph (105M vertices, 3.7B edges) within cluster memory.
-
-#### Pillar 3: ICE — Incremental Computation by Entity Expansion (Section 4 of paper)
-
-ICE is Tegra's computation model for avoiding redundant work. Four phases:
-
-1. **Initial execution**: Full computation; every iteration's state saved as a timelapse snapshot (e.g., `TWTR_1577869200_PR_1`, `TWTR_1577869200_PR_2`, ...).
-
-2. **Bootstrap**: For a new graph snapshot, identify changed entities via `diff()`, expand to 1-hop neighborhood via `expand()`, run computation on this subgraph.
-
-3. **Iterations**: At each iteration, diff the subgraph result against the stored timelapse iteration snapshot. Expand changed entities. Copy unchanged entities from stored state via `merge()`. This is the key correctness mechanism — ICE generates *identical* intermediate states as full re-execution (Section 4.2, proven by construction).
-
-4. **Termination**: Not just when the subgraph converges, but when no entity needs state copied from stored snapshots. This handles cases where modifications cause more (or fewer) iterations than the initial execution.
-
-**Critical property**: ICE is algorithm-independent. Any algorithm implemented in the GAS model can be made incremental without algorithm-specific refinement functions (unlike GraphBolt which requires custom `repropagate`, `retract`, `propagate` per algorithm).
-
-**Switching heuristic** (Section 4.3): When incremental computation becomes more expensive than full re-execution (e.g., high-degree vertex changes cascade widely), a random forest classifier decides at iteration boundaries whether to switch. Features include active vertex count, average degree, partition activity, message counts, network transfer, and graph characteristics.
-
-### 2.3 Key Experimental Results
-
-| Metric | Result | Conditions |
-|--------|--------|------------|
-| Snapshot retrieval | 1.34s (TEGRA) vs 30.2s (DD) | 200 snapshots, Twitter graph |
-| Ad-hoc single snapshot | 18-30x vs DD, 8-18x vs GraphBolt | 100 random windows, 0.1% change |
-| Ad-hoc window (size 10) | 9-17x vs DD, 5-23x vs GraphBolt | Same setup |
-| Memory growth | O(\|V\|) vs DD's O(\|E\|) per operator | 1M edge updates, Twitter |
-| Scale | 50B edges, 1000 snapshots | Facebook synthetic data |
-| Timelapse parallel | 36x speedup over GraphX serial | 20 snapshots, Twitter CC |
-| Streaming (weakness) | DD/GraphBolt significantly faster | Online queries, continuous updates |
-| Temporal (weakness) | 15% overhead vs Chronos | Tree structure overhead |
-
-### 2.4 Limitations Acknowledged in the Paper
-
-1. **Streaming performance**: Tegra accumulates batches (Spark-oriented); DD/GraphBolt push individual updates faster. Tegra is not designed for pure streaming.
-2. **Tree overhead**: 15% slowdown vs. array-based Chronos for purely temporal (known-window) analysis.
-3. **COST**: 32 cores to match single-threaded optimized implementation. Property graph overhead is real.
-4. **Fault tolerance**: Coarse-grained only (Spark checkpoint). No fine-grained lineage recovery.
-5. **Switching heuristic**: Simple random forest; paper acknowledges room for improvement.
-
-### 2.5 What We Improve in Tegra-J
-
-1. **Decouple from Spark**: The original Tegra is a "drop-in replacement for GraphX" — tightly coupled to Spark's execution model, RDD semantics, and JVM tuning. Tegra-J is standalone.
-2. **Off-heap persistent data structures**: Address the GC concern directly. Tree nodes live outside the Java heap.
-3. **Virtual thread-based distribution**: Replace Spark's bulk-synchronous model with lightweight, reactive message passing.
-4. **Pluggable computation models**: GAS as default, but SPI allows Pregel, subgraph-centric, or custom models.
-5. **Streaming bridge**: Optional adapter for Apache Flink or Kafka Streams ingestion, addressing the streaming weakness.
-6. **Better eviction**: Tiered storage (heap → off-heap → local SSD → distributed FS) with configurable policies beyond simple LRU.
-
----
-
-## 3. Why Java 21
-
-The implementation guide (paper2.md) raises a valid concern:
-
-> *"Java/Kotlin on JVM would work but the GC overhead may be problematic for a system that creates many short-lived tree nodes during path-copying."*
-
-Java 21 fundamentally changes this equation. Here is our counter-argument:
-
-### 3.1 The GC Problem is Solvable
-
-**Path-copying creates O(log_256 n) new nodes per mutation.** For a graph with 100M vertices, that's ~4-5 nodes per mutation. In a batch of 10K mutations committed as one snapshot, that's ~50K new node objects. This is well within modern GC capabilities, but at scale (1000 snapshots, billions of edges), cumulative pressure matters.
-
-Our answer is threefold:
-
-1. **Foreign Memory API (JEP 454, finalized in Java 22, preview in 21)**: Tree nodes are allocated off-heap in `Arena`-managed `MemorySegment`s. The GC never sees them. Reference counting handles lifecycle. This is the same strategy used by Apache Arrow, Netty, and RocksDB's JNI layer.
-
-2. **ZGC (Production-ready since Java 15)**: For the objects that *do* live on-heap (vertex properties, user-facing wrappers, message objects), ZGC delivers sub-millisecond pause times regardless of heap size. ZGC's concurrent relocation eliminates the stop-the-world pauses that would disrupt graph computation.
-
-3. **Arena allocators for batch operations**: During a `commit()`, all path-copied nodes are allocated from a single arena. This gives locality, fast bulk deallocation, and zero fragmentation.
-
-### 3.2 Java 21 Features That Directly Benefit Tegra
-
-| Feature | JEP | Benefit for Tegra-J |
-|---------|-----|---------------------|
-| **Virtual Threads** | 444 (Final) | Millions of concurrent snapshot operations, lightweight per-partition message handlers, async ICE computation pipelines |
-| **Structured Concurrency** | 462 (Preview) | Distributed snapshot barriers — fork per partition, join with timeout, cancel stragglers |
-| **Scoped Values** | 446 (Preview) | Thread-local snapshot context propagation through GAS computation without parameter threading |
-| **Record Classes** | 395 (Final) | Immutable value types for VertexId, EdgeId, SnapshotId, GraphDelta, Message. Compact, equals/hashCode for free |
-| **Sealed Interfaces** | 409 (Final) | Closed type hierarchies for ART/HAMT node types (Node4, Node16, Node48, Node256, Leaf). Enables exhaustive pattern matching |
-| **Pattern Matching** | 441 (Final) | Clean dispatch on node types during tree traversal, diff computation, message handling |
-| **Foreign Function & Memory API** | 454 (Preview in 21, Final 22) | Off-heap tree node storage, zero-copy serialization, memory-mapped snapshot files |
-| **Sequenced Collections** | 431 (Final) | Ordered snapshot sequences in Timelapse |
-| **String Templates** | 430 (Preview) | Diagnostic logging, snapshot ID generation |
-| **JPMS** | 261 (Since 9) | Strong module encapsulation; public API vs. internal implementation |
-
-### 3.3 Ecosystem Advantages
-
-- **Apache ecosystem alignment**: Spark, Flink, Kafka, Hadoop, TinkerPop, Arrow — all JVM-native. Integration is first-class, not via FFI.
-- **Deployment ubiquity**: Every major cloud provider, container runtime, and enterprise environment has JVM support. No Rust toolchain required on target.
-- **Contributor pool**: Java remains the most widely known language among data infrastructure engineers. ASF projects are predominantly JVM-based.
-- **Observability**: JFR (Java Flight Recorder), async-profiler, JMX — mature production observability with zero-cost-when-off profiling.
-
-### 3.4 Addressing Remaining Performance Gaps
-
-The paper's Scala/Spark implementation already achieves 18-30x speedup over DD (Rust) for ad-hoc operations. Our Java 21 implementation should be *faster* than the original because:
-
-1. **No Spark overhead**: Spark's scheduling, serialization, and RDD materialization are significant costs. The paper explicitly uses "barrier execution mode to avoid most Spark overheads" — we eliminate Spark entirely.
-2. **Off-heap data structures**: Path-copying becomes allocation in pre-mapped memory regions, not GC-tracked object creation.
-3. **Virtual threads eliminate thread-pool sizing problems**: The original's distributed GAS required careful thread management. Virtual threads make this trivial.
-4. **JIT compilation**: HotSpot C2 / Graal JIT produce highly optimized native code for the tight loops in tree traversal and GAS phases. Profile-guided optimization kicks in after warmup.
-
----
-
-## 4. System Architecture for Tegra-J
+The paper defines a layered architecture (§2.4, Figure 2):
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        tegra-api (public)                            │
-│  Timelapse<V,E>  │  GraphSnapshot<V,E>  │  GraphView<V,E>           │
-│  TimelapseBuilder │  SnapshotId          │  GraphAlgorithm<V,E,R>   │
-└──────┬───────────────────┬───────────────────────┬───────────────────┘
-       │                   │                       │
-       ▼                   ▼                       ▼
-┌──────────────┐  ┌─────────────────┐  ┌───────────────────────┐
-│ tegra-store  │  │ tegra-compute   │  │ tegra-algorithms      │
-│              │  │                 │  │                       │
-│  DGSI        │  │  ICE Engine     │  │  PageRank             │
-│  VersionMap  │  │  GAS Framework  │  │  ConnectedComponents  │
-│  SnapshotMgr │  │  DiffEngine     │  │  BeliefPropagation    │
-│  EvictionMgr │  │  SwitchOracle   │  │  TriangleCount        │
-│              │  │                 │  │  LabelPropagation     │
-└──────┬───────┘  └────────┬────────┘  │  BFS / SSSP / k-hop  │
-       │                   │           └───────────────────────┘
-       ▼                   ▼
-┌──────────────────────────────────────┐
-│          tegra-pds (core)            │
-│                                      │
-│  PersistentART<K,V>                  │
-│  PersistentHAMT<K,V>                │
-│  Node4 / Node16 / Node48 / Node256  │
-│  OffHeapArena                        │
-│  PathCopyEngine                      │
-│  DiffIterator                        │
-└──────────────────────────────────────┘
-       │                   │
-       ▼                   ▼
-┌──────────────┐  ┌─────────────────┐
-│ tegra-serde  │  │ tegra-cluster   │
-│              │  │                 │
-│  Serializer  │  │  Partitioner    │
-│  DiskStore   │  │  BarrierCoord   │
-│  MMapLoader  │  │  MessageRouter  │
-│  ArrowBridge │  │  VirtualRPC     │
-└──────────────┘  └─────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                     User Applications                         │
+│        (Graph algorithms, ad-hoc queries, what-if analysis)   │
+├───────────────────────────────────────────────────────────────┤
+│                     Timelapse API (§3)                         │
+│    save · retrieve · diff · expand · merge                    │
+│    Snapshot-aware graph operators (vertices, mapV, etc.)       │
+├───────────────────────────────────────────────────────────────┤
+│                     ICE Engine (§4)                            │
+│    GAS decomposition · IncPregel · Bootstrap · Iterations     │
+│    Learning-based switching (§4.3)                             │
+├─────────────────────────┬─────────────────────────────────────┤
+│       DGSI (§5)         │       Cluster Layer (§6)            │
+│  pART vertex tree       │  Hash partitioning                  │
+│  pART edge tree         │  Barrier snapshot protocol          │
+│  Version management     │  Direct task communication          │
+│  LRU eviction           │  Cross-partition GAS messaging      │
+│  Disk serialization     │                                     │
+├─────────────────────────┴─────────────────────────────────────┤
+│                     Persistent ART (§5.1)                     │
+│    Node4 · Node16 · Node48 · Node256 · Leaf                  │
+│    Path-copying · Reference counting · Prefix matching        │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 Dependency Direction
+### Data Flow
 
-The dependency graph is strictly acyclic and layered:
+1. **Ingestion**: Updates arrive as batches of vertex/edge mutations. Each update is routed to the correct partition based on vertex hash. After a batch, a coordinated barrier triggers all partitions to `commit` simultaneously, creating a consistent distributed snapshot.
 
-```
-tegra-api  →  tegra-store, tegra-compute, tegra-algorithms
-tegra-store  →  tegra-pds, tegra-serde
-tegra-compute  →  tegra-pds, tegra-store
-tegra-algorithms  →  tegra-compute, tegra-api
-tegra-cluster  →  tegra-store, tegra-compute, tegra-serde
-tegra-serde  →  tegra-pds
-tegra-pds  →  (no internal dependencies; only java.base + jdk.incubator.foreign)
-```
+2. **Storage**: Each partition stores its subgraph in two pART trees (vertex, edge). Commits create new tree roots via path-copying. Shared subtrees between versions are reference-counted.
 
-### 4.2 Design Principles
+3. **Query**: A user retrieves one or more snapshots via Timelapse. Each snapshot is a pair of pART roots. If previous computation state exists in the timelapse, ICE performs incremental computation. Otherwise, full GAS execution runs.
 
-1. **Embedded-first**: The core (tegra-pds + tegra-store + tegra-compute) runs in a single JVM with zero external dependencies. Distribution is an opt-in layer.
-2. **Zero-copy by default**: Snapshot access returns views backed by the persistent tree, not materialized copies.
-3. **Immutability as a type-level guarantee**: `GraphSnapshot<V,E>` is sealed and has no mutation methods. All mutation goes through `MutableGraphView`, which produces a new snapshot on `commit()`.
-4. **SPI everywhere**: Storage backend, serialization format, partitioning strategy, eviction policy, and computation model are all pluggable via `java.util.ServiceLoader`.
-5. **Generics for type safety**: `Timelapse<V, E>` where V is the vertex property type and E is the edge property type. No `Object` casts in user code.
+4. **Eviction**: A background thread monitors snapshot access timestamps. Least-recently-used snapshots have their unique subtrees serialized to disk, replaced by file pointers.
 
 ---
 
-## 5. Module Structure & Project Layout
+## 3. Module Decomposition
 
 ```
 tegra-j/
-├── pom.xml                          # Parent POM (Maven multi-module)
-├── bom/pom.xml                      # Bill of Materials for version alignment
-│
-├── tegra-pds/                       # Persistent Data Structures
-│   ├── src/main/java/
-│   │   └── org/tegra/pds/
-│   │       ├── module-info.java
-│   │       ├── art/                 # Adaptive Radix Tree (persistent)
-│   │       │   ├── ArtNode.java     # Sealed interface
-│   │       │   ├── Node4.java
-│   │       │   ├── Node16.java
-│   │       │   ├── Node48.java
-│   │       │   ├── Node256.java
-│   │       │   ├── Leaf.java
-│   │       │   └── PersistentART.java
-│   │       ├── hamt/                # Hash Array Mapped Trie (persistent)
-│   │       │   ├── HamtNode.java
-│   │       │   ├── BitmapIndexedNode.java
-│   │       │   ├── ArrayNode.java
-│   │       │   ├── CollisionNode.java
-│   │       │   └── PersistentHAMT.java
-│   │       ├── common/
-│   │       │   ├── PathCopyResult.java  # record
-│   │       │   ├── DiffEntry.java       # record
-│   │       │   └── TrieIterator.java
-│   │       └── memory/
-│   │           ├── OffHeapArena.java
-│   │           ├── NodeAllocator.java
-│   │           └── RefCounted.java
-│   └── src/test/java/
-│
-├── tegra-store/                     # DGSI implementation
-│   ├── src/main/java/
-│   │   └── org/tegra/store/
-│   │       ├── module-info.java
-│   │       ├── VersionMap.java
-│   │       ├── SnapshotStore.java
-│   │       ├── GraphPartition.java
-│   │       ├── VertexStore.java
-│   │       ├── EdgeStore.java
-│   │       ├── SnapshotManager.java
-│   │       ├── EvictionManager.java
-│   │       ├── EvictionPolicy.java      # SPI interface
-│   │       ├── LruEvictionPolicy.java
-│   │       └── MutationLog.java
-│   └── src/test/java/
-│
-├── tegra-api/                       # Public user-facing API
-│   ├── src/main/java/
-│   │   └── org/tegra/api/
-│   │       ├── module-info.java
-│   │       ├── Timelapse.java
-│   │       ├── TimelapseBuilder.java
-│   │       ├── GraphSnapshot.java       # sealed, read-only
-│   │       ├── MutableGraphView.java
-│   │       ├── GraphView.java           # sealed, parent
-│   │       ├── SnapshotId.java          # record
-│   │       ├── VertexId.java            # record
-│   │       ├── EdgeId.java              # record
-│   │       ├── Vertex.java              # record
-│   │       ├── Edge.java                # record
-│   │       ├── GraphDelta.java          # record
-│   │       ├── PropertyMap.java
-│   │       └── TegraConfig.java
-│   └── src/test/java/
-│
-├── tegra-compute/                   # ICE + GAS computation engine
-│   ├── src/main/java/
-│   │   └── org/tegra/compute/
-│   │       ├── module-info.java
-│   │       ├── gas/
-│   │       │   ├── GatherFunction.java
-│   │       │   ├── ApplyFunction.java
-│   │       │   ├── ScatterFunction.java
-│   │       │   ├── VertexProgram.java
-│   │       │   ├── GasEngine.java
-│   │       │   └── GasContext.java
-│   │       ├── ice/
-│   │       │   ├── IceEngine.java
-│   │       │   ├── DiffEngine.java
-│   │       │   ├── NeighborhoodExpander.java
-│   │       │   ├── SubgraphExtractor.java
-│   │       │   ├── StateMerger.java
-│   │       │   └── SwitchOracle.java
-│   │       ├── pregel/
-│   │       │   ├── PregelEngine.java
-│   │       │   └── MessageCombiner.java
-│   │       └── spi/
-│   │           ├── ComputeEngine.java   # SPI interface
-│   │           └── ComputeResult.java
-│   └── src/test/java/
-│
-├── tegra-algorithms/                # Built-in graph algorithms
-│   ├── src/main/java/
-│   │   └── org/tegra/algorithms/
-│   │       ├── module-info.java
-│   │       ├── PageRank.java
-│   │       ├── ConnectedComponents.java
-│   │       ├── BeliefPropagation.java
-│   │       ├── TriangleCount.java
-│   │       ├── LabelPropagation.java
-│   │       ├── ShortestPath.java
-│   │       ├── BreadthFirstSearch.java
-│   │       └── KHop.java
-│   └── src/test/java/
-│
-├── tegra-serde/                     # Serialization & disk persistence
-│   ├── src/main/java/
-│   │   └── org/tegra/serde/
-│   │       ├── module-info.java
-│   │       ├── Serializer.java          # SPI interface
-│   │       ├── BinarySerializer.java
-│   │       ├── DiskSnapshotStore.java
-│   │       ├── MMapSnapshotLoader.java
-│   │       └── ArrowBridge.java         # Optional Apache Arrow integration
-│   └── src/test/java/
-│
-├── tegra-cluster/                   # Distribution layer
-│   ├── src/main/java/
-│   │   └── org/tegra/cluster/
-│   │       ├── module-info.java
-│   │       ├── ClusterManager.java
-│   │       ├── Partitioner.java         # SPI interface
-│   │       ├── HashPartitioner.java
-│   │       ├── TwoDPartitioner.java
-│   │       ├── BarrierCoordinator.java
-│   │       ├── MessageRouter.java
-│   │       ├── RemoteVertexProxy.java
-│   │       └── rpc/
-│   │           ├── RpcServer.java
-│   │           ├── RpcClient.java
-│   │           └── VirtualThreadDispatcher.java
-│   └── src/test/java/
-│
-├── tegra-benchmark/                 # JMH benchmarks
-│   └── src/main/java/
-│       └── org/tegra/benchmark/
-│           ├── HamtBenchmark.java
-│           ├── ArtBenchmark.java
-│           ├── SnapshotRetrievalBenchmark.java
-│           ├── PathCopyBenchmark.java
-│           ├── IceBenchmark.java
-│           └── EndToEndBenchmark.java
-│
-└── tegra-examples/                  # Usage examples
-    └── src/main/java/
-        └── org/tegra/examples/
-            ├── QuickStart.java
-            ├── TemporalAnalysis.java
-            ├── AdHocWindowQuery.java
-            ├── WhatIfAnalysis.java
-            └── SlidingWindowPageRank.java
+├── tegra-pds/            # Persistent Adaptive Radix Tree
+├── tegra-store/          # DGSI: versioned graph store
+├── tegra-api/            # Timelapse abstraction & user API
+├── tegra-compute/        # ICE computation model + GAS engine
+├── tegra-cluster/        # Distribution, partitioning, barriers
+├── tegra-serde/          # Binary serialization for disk & network
+├── tegra-algorithms/     # Standard graph algorithms on GAS
+├── tegra-benchmark/      # Evaluation harness (paper §7)
+├── tegra-examples/       # Usage examples and demos
+├── build.gradle.kts      # Root build configuration
+└── settings.gradle.kts   # Module declarations
 ```
 
-### 5.1 Build System
+### Module Dependency Graph
 
-Maven with BOM for version management. Reasons:
-- ASF standard (most Apache projects use Maven)
-- Reproducible builds with `maven-enforcer-plugin`
-- JPMS support via `maven-compiler-plugin` with `--module-path`
-- Shade plugin for fat JARs in distributed mode
-- JMH benchmarks via `jmh-maven-plugin`
-
-Gradle wrapper also provided for contributors who prefer it.
-
-### 5.2 Java Module System (JPMS)
-
-Each module declares explicit dependencies and exports:
-
-```java
-// tegra-pds/src/main/java/module-info.java
-module org.tegra.pds {
-    exports org.tegra.pds.art;
-    exports org.tegra.pds.hamt;
-    exports org.tegra.pds.common;
-    // memory package is internal — not exported
-}
-
-// tegra-api/src/main/java/module-info.java
-module org.tegra.api {
-    requires org.tegra.pds;
-    requires org.tegra.store;
-    exports org.tegra.api;
-}
+```
+tegra-pds
+    ↑
+tegra-serde ──→ tegra-pds
+    ↑
+tegra-store ──→ tegra-pds, tegra-serde
+    ↑
+tegra-api ────→ tegra-store
+    ↑
+tegra-compute → tegra-api, tegra-store
+    ↑
+tegra-cluster → tegra-compute, tegra-store, tegra-serde
+    ↑
+tegra-algorithms → tegra-compute, tegra-api
+    ↑
+tegra-benchmark ─→ tegra-algorithms, tegra-cluster
+tegra-examples ──→ tegra-algorithms, tegra-cluster
 ```
 
-This enforces that users can only depend on `tegra-api` and `tegra-algorithms` — internal data structures are encapsulated.
+### JPMS Module Names
+
+| Gradle Module | JPMS Module | Exports |
+|---------------|-------------|---------|
+| `tegra-pds` | `org.tegra.pds` | `org.tegra.pds.art`, `org.tegra.pds.art.node` |
+| `tegra-serde` | `org.tegra.serde` | `org.tegra.serde` |
+| `tegra-store` | `org.tegra.store` | `org.tegra.store`, `org.tegra.store.graph`, `org.tegra.store.version` |
+| `tegra-api` | `org.tegra.api` | `org.tegra.api`, `org.tegra.api.snapshot`, `org.tegra.api.timelapse` |
+| `tegra-compute` | `org.tegra.compute` | `org.tegra.compute.gas`, `org.tegra.compute.ice` |
+| `tegra-cluster` | `org.tegra.cluster` | `org.tegra.cluster`, `org.tegra.cluster.partition` |
+| `tegra-algorithms` | `org.tegra.algorithms` | `org.tegra.algorithms` |
+| `tegra-benchmark` | `org.tegra.benchmark` | (none — application module) |
 
 ---
 
-## 6. Component 1: Persistent Data Structures (tegra-pds)
+## 4. Component Specifications
 
-This is the most technically critical module. It implements the persistent (functional) tree structures that underpin DGSI's structural sharing.
+### 4.1 tegra-pds: Persistent Adaptive Radix Tree (pART)
 
-### 6.1 Strategy: HAMT First, ART Second
+**Paper reference**: §5.1, §5.2, reference [5] (ankurdave/part), reference [38] (Leis et al., ICDE 2013)
 
-Following the paper's own recommendation (Section 5, "Simplification for v1"):
+The paper states: *"DGSI uses a persistent version of the Adaptive Radix Tree [38] as its data structure. ART provides several properties useful for graph storage such as efficient updates and range scans. Persistent Adaptive Radix Tree (PART) [5] adds persistence to ART by simple path-copying. For the purpose of building DGSI, we reimplemented PART (hereafter pART) in Scala and made several modifications to optimize it for graph state storage."*
 
-**Phase 1 — Persistent HAMT (Hash Array Mapped Trie):**
-- Well-understood data structure (Bagwell 2001; used by Clojure, Scala, Haskell)
-- 32-way branching at each level (5 bits of hash per level)
-- Structural sharing via path-copying: modify a leaf → copy O(log_32 n) = O(7) nodes for 1B entries
-- Bitmap indexing for sparse nodes keeps memory compact
-- Java implementations exist for reference (Capsule by Steindorfer, paguro by GlenPeterson)
+#### 4.1.1 ART Node Types
 
-**Phase 2 — Persistent ART (Adaptive Radix Tree):**
-- The paper's actual data structure choice for production
-- Variable fan-out (4, 16, 48, 256) adapts to key distribution
-- Better cache performance than HAMT for range scans (important for edge retrieval)
-- O(k) lookup where k = key length (not dependent on N)
-- Prefix compression reduces tree depth
-
-### 6.2 HAMT Design
-
-```java
-public sealed interface HamtNode<K, V>
-    permits BitmapIndexedNode, ArrayNode, CollisionNode, EmptyNode {
-
-    HamtNode<K, V> put(K key, V value, int hash, int shift, MutationContext ctx);
-    HamtNode<K, V> remove(K key, int hash, int shift, MutationContext ctx);
-    V get(K key, int hash, int shift);
-    DiffIterator<K, V> diff(HamtNode<K, V> other);
-    int size();
-}
-```
-
-**Node types:**
-
-| Type | When Used | Layout |
-|------|-----------|--------|
-| `EmptyNode` | Singleton empty trie | No fields |
-| `BitmapIndexedNode` | < 16 children at this level | `int bitmap` + `Object[] contents` (interleaved key/value/subnode) |
-| `ArrayNode` | >= 16 children | `HamtNode[32] children` (direct-indexed, no bitmap) |
-| `CollisionNode` | Hash collision at this level | `Entry<K,V>[] entries` (linear scan, rare) |
-
-**Path-copying with transient mutation optimization:**
-
-During a `commit()` that batches many mutations, we use a `MutationContext` (inspired by Clojure's `edit` field):
-- Nodes created during the current batch share a `MutationContext` token.
-- Mutations to nodes with the current token are done **in-place** (no copy needed).
-- Once `commit()` is called, the token is invalidated, and all nodes become persistent.
-- This optimization is critical: it means batching 10K mutations creates only the final structural diff, not 10K intermediate copies.
-
-```java
-public record MutationContext(Thread owner, long epoch) {
-    // In-place mutation is allowed only if the node's context matches
-    // the current context AND we're on the owning thread.
-    public boolean isEditable() {
-        return owner == Thread.currentThread();
-    }
-}
-```
-
-### 6.3 ART Design
-
-The Adaptive Radix Tree uses 4 node types based on fan-out:
+The Adaptive Radix Tree (Leis et al.) defines four internal node types that adaptively grow/shrink based on the number of children, plus a leaf type:
 
 ```java
 public sealed interface ArtNode<V>
-    permits Node4, Node16, Node48, Node256, ArtLeaf {
-    // ...
+    permits Node4, Node16, Node48, Node256, Leaf {
+
+    ArtNode<V> insert(byte[] key, int depth, V value);
+    ArtNode<V> remove(byte[] key, int depth);
+    V lookup(byte[] key, int depth);
+    ArtIterator<V> iterator();
+    ArtIterator<V> prefixIterator(byte[] prefix);
+    int size();
+    int refCount();
 }
-
-// Node4: Up to 4 children. Keys stored in sorted array, binary search.
-public final class Node4<V> implements ArtNode<V> {
-    byte[] keys;     // length 4
-    ArtNode<V>[] children; // length 4
-    int count;
-    byte[] prefix;   // path compression
-    int prefixLen;
-}
-
-// Node16: Up to 16 children. Keys stored in sorted array.
-// On x86, SIMD comparison for key lookup (via Vector API or manual unrolling).
-
-// Node48: Up to 48 children. 256-element index array mapping byte → child slot.
-// Avoids scanning; direct lookup. Slot array has 48 entries.
-
-// Node256: Direct mapping. children[byte] = child. No key search needed.
-
-// ArtLeaf: Terminal node storing the full key and value.
 ```
 
-**Persistence via path-copying** is identical to HAMT: modifying a leaf copies the path from leaf to root. Growth/shrink operations (Node4 → Node16, etc.) are handled during path-copying.
+| Node Type | Children Capacity | Key Storage | Lookup Strategy |
+|-----------|------------------|-------------|-----------------|
+| `Node4` | 1–4 | Sorted byte array (4 bytes) | Linear scan |
+| `Node16` | 5–16 | Sorted byte array (16 bytes) | Binary search or SIMD-style |
+| `Node48` | 17–48 | 256-byte index → 48 child slots | Index lookup |
+| `Node256` | 49–256 | Direct 256-slot array | Direct indexing |
+| `Leaf` | 0 | Full key stored | Exact match |
 
-**Prefix compression** is essential for byte-key efficiency. Shared prefixes are stored once in the nearest common ancestor rather than replicated in every descendant.
+Node transitions:
 
-### 6.4 Off-Heap Memory Architecture
+```
+Insert: Node4 → Node16 → Node48 → Node256
+Remove: Node256 → Node48 → Node16 → Node4
+```
 
-The critical innovation for Java: store tree nodes off-heap to avoid GC pressure.
+#### 4.1.2 Persistence via Path-Copying
+
+The paper specifies path-copying for persistence (§5.1): when a mutation occurs at a leaf, every node on the path from root to that leaf is copied. Unchanged subtrees are shared between old and new versions.
+
+```
+insert(key=0x0A_0B_0C, value=v2):
+
+  root₁            root₂ (new)
+   |                 |
+  [0A]              [0A] (copy)
+   |                 |
+  [0B]              [0B] (copy)
+   |                 |
+  leaf(v1)          leaf(v2) (new)
+
+All sibling subtrees of root₁ are shared with root₂.
+```
+
+Cost: O(depth) = O(log₂₅₆ n) node copies per mutation. For 64-bit keys, depth ≤ 8.
+
+#### 4.1.3 Path Compression (Lazy Expansion)
+
+ART uses path compression to collapse single-child chains. Two variants exist:
+
+- **Pessimistic**: Store a partial key prefix in each node (bounded length, overflow requires key comparison at leaf).
+- **Optimistic**: Store the full partial prefix (variable length, no overflow).
+
+The paper does not specify which variant. We use pessimistic with a maximum prefix length of 8 bytes (matching the original ART paper's recommendation), storing the full key in leaves for disambiguation.
 
 ```java
-public final class OffHeapArena implements AutoCloseable {
-    private final Arena arena;  // java.lang.foreign.Arena
-    private final MemorySegment segment;
-    private long offset;
+public record PrefixData(byte[] prefix, int length) {}
+```
 
-    public OffHeapArena(long capacityBytes) {
-        this.arena = Arena.ofShared();
-        this.segment = arena.allocate(capacityBytes);
-        this.offset = 0;
-    }
+Each internal node carries a `PrefixData` for its compressed path segment.
 
-    public long allocate(int size) {
-        long addr = offset;
-        offset += align(size, 8); // 8-byte alignment
-        return addr;
-    }
+#### 4.1.4 Reference Counting
 
-    public MemorySegment slice(long offset, long size) {
-        return segment.asSlice(offset, size);
-    }
+The paper states reference counting is used for garbage collection of shared nodes (§5.4): *"Decrement reference counts on all nodes reachable only from this root. Nodes with zero references are freed."*
 
-    @Override
-    public void close() {
-        arena.close();
-    }
+Each `ArtNode` maintains an `int refCount`. When a new root is created by path-copying, copied nodes start with refCount=1. Shared children have their refCount incremented. When a version is evicted, refCounts are decremented, and nodes reaching zero are freed.
+
+In Java, "freeing" means making the node unreachable for GC. For off-heap nodes (see §5.1), explicit deallocation via `Arena.close()` is used.
+
+#### 4.1.5 Key Types
+
+The paper specifies two key formats (§5.2):
+
+- **Vertex keys**: 64-bit integers. Encoded as 8-byte big-endian arrays for lexicographic ordering in the ART.
+- **Edge keys**: Arbitrary byte arrays. Default: `src_id (8 bytes) || dst_id (8 bytes) || discriminator (2 bytes)` = 18 bytes. This enables prefix matching on source vertex to retrieve all outgoing edges.
+
+```java
+public final class KeyCodec {
+    public static byte[] encodeVertexKey(long vertexId);
+    public static long decodeVertexKey(byte[] key);
+    public static byte[] encodeEdgeKey(long srcId, long dstId, short discriminator);
+    public static EdgeKey decodeEdgeKey(byte[] key);
+}
+
+public record EdgeKey(long srcId, long dstId, short discriminator) {}
+```
+
+#### 4.1.6 Primitive Specialization
+
+The paper states: *"We create specialized versions of pART to avoid (un)boxing costs when properties are primitive types."*
+
+We provide specialized leaf implementations for common primitive types:
+
+```java
+public sealed interface LeafValue
+    permits BoxedLeafValue, LongLeafValue, DoubleLeafValue, IntLeafValue {
+}
+
+public record LongLeafValue(long value) implements LeafValue {}
+public record DoubleLeafValue(double value) implements LeafValue {}
+public record IntLeafValue(int value) implements LeafValue {}
+public record BoxedLeafValue<V>(V value) implements LeafValue {}
+```
+
+#### 4.1.7 Iterators
+
+The paper states: *"providing fast iterators"* as a key engineering optimization. The pART supports:
+
+- **Full iteration**: In-order traversal of all leaves.
+- **Prefix iteration**: Traverse only leaves whose keys start with a given prefix. This is critical for Timelapse retrieval (§5.3.1).
+- **Range iteration**: Traverse leaves whose keys fall within [start, end). Used for time-windowed snapshot retrieval.
+
+Iterators are implemented as lazy, stack-based traversals to avoid materializing the full key set.
+
+```java
+public interface ArtIterator<V> extends Iterator<Map.Entry<byte[], V>> {
+    boolean hasNext();
+    Map.Entry<byte[], V> next();
+    void seekTo(byte[] key);  // jump to first key >= given key
 }
 ```
 
-**Node layout in off-heap memory (example: HAMT BitmapIndexedNode):**
+#### 4.1.8 Bulk Loading Optimization
 
-```
-Offset  Size   Field
-0       4      bitmap (int)
-4       4      count (int)
-8       4      mutationEpoch (int)
-12      4      reserved/padding
-16      8*N    child pointers (long offsets into arena, or tagged pointers)
-16+8N   ?      inline leaf data (for small values)
-```
+The paper mentions: *"optimizing path copying under heavy writes."* For bulk ingestion (initial graph load or large batches), we provide a mutable builder that constructs the tree bottom-up without path-copying overhead, then freezes it into a persistent root.
 
-**Tagged pointers** distinguish node types without virtual dispatch:
-- Bits 0-1: node type tag (00 = BitmapIndexed, 01 = Array, 10 = Collision, 11 = Leaf)
-- Bits 2-63: offset into arena
-
-This eliminates polymorphic call overhead in tight traversal loops — a common source of JIT deoptimization in tree-heavy code.
-
-### 6.5 Diff Algorithm
-
-The `diff()` operation is central to ICE. For persistent trees, diffing is highly efficient because **structurally shared subtrees are referentially equal** — a pointer comparison skips entire unchanged subtrees.
-
-```
-diff(nodeA, nodeB):
-    if nodeA == nodeB:       // Same reference → identical subtree
-        return EMPTY_DIFF    // Skip entirely (this is the key optimization)
-    if both are leaves:
-        return MODIFIED(nodeA.key, nodeA.value, nodeB.value)
-    for each child position:
-        childA = nodeA.child(pos)
-        childB = nodeB.child(pos)
-        if childA == null and childB != null:
-            yield all entries in childB as ADDED
-        elif childA != null and childB == null:
-            yield all entries in childA as REMOVED
-        elif childA != childB:        // Different references → recurse
-            yield diff(childA, childB)
-        // else: childA == childB → skip (shared structure)
+```java
+public final class ArtBuilder<V> {
+    public void put(byte[] key, V value);
+    public ArtNode<V> build();  // returns immutable persistent root
+}
 ```
 
-Complexity: O(d) where d = number of *changed* entries, not total entries. For Tegra's use case (0.1% change between snapshots), this means diffing a 100M-vertex graph examines only ~100K nodes.
+#### 4.1.9 Memory Layout Considerations
+
+The paper warns about JVM GC overhead: *"Java/Kotlin on JVM would work but the GC overhead may be problematic for a system that creates many short-lived tree nodes during path-copying."*
+
+We mitigate this with three strategies:
+
+1. **Arena-scoped allocation for transient nodes**: During branch-commit operations, path-copied nodes are allocated in a thread-local arena. The paper states: *"Between branch and commit operations, it is likely that many transient child nodes are formed. We aggressively remove them during the commit operation."* Using `Arena.ofConfined()`, transient nodes can be bulk-freed after commit.
+
+2. **In-place updates during branch-commit**: The paper states: *"we enable in-place updates when the operations are local, such as after a branch and before a commit."* When a branch is created, the transient root and its path-copies are mutable until commit. This avoids repeated path-copying for multiple mutations in the same transaction.
+
+3. **Object pooling for internal nodes**: Since ART nodes have a fixed set of sizes (Node4, Node16, Node48, Node256), we pool and reuse node objects to reduce allocation pressure.
 
 ---
 
-## 7. Component 2: DGSI — Distributed Graph Snapshot Index (tegra-store)
+### 4.2 tegra-store: DGSI (Distributed Graph Snapshot Index)
 
-### 7.1 Core Abstractions
+**Paper reference**: §5
+
+#### 4.2.1 Per-Partition Graph Store
+
+Each partition in DGSI stores (§5.2):
+
+- A **vertex pART**: keys are 64-bit vertex IDs, values are vertex property containers.
+- An **edge pART**: keys are byte arrays (src||dst||discriminator), values are edge property containers.
+- A **version map**: maps version IDs (byte arrays) to `(vertexRoot, edgeRoot)` pairs.
 
 ```java
-/**
- * A single partition's graph storage. Each partition stores
- * a vertex tree and an edge tree, both persistent.
- */
-public final class GraphPartition<V, E> {
-    private final PersistentART<Long, VertexData<V>> vertexTree;
-    private final PersistentART<byte[], EdgeData<E>> edgeTree;
-    private final VersionMap versions;
-    private final EvictionManager eviction;
-    private final MutationLog mutationLog;
-    // ...
+public final class PartitionStore {
+    private final ConcurrentHashMap<ByteArray, VersionEntry> versionMap;
+    private final LruEvictionManager evictionManager;
+    private final DiskStore diskStore;
+
+    public VersionEntry branch(ByteArray versionId);
+    public ByteArray commit(WorkingVersion working, ByteArray newVersionId);
+    public GraphView retrieve(ByteArray versionId);
+    public void evict(ByteArray versionId);
 }
-```
 
-### 7.2 Version Map
-
-The version map is itself a persistent data structure — a HAMT keyed by `SnapshotId` (byte array) storing root pairs:
-
-```java
-public record VersionRoot<V, E>(
-    ArtNode<VertexData<V>> vertexRoot,
-    ArtNode<EdgeData<E>> edgeRoot,
-    Instant timestamp,
-    long mutationLogOffset  // pointer to mutations since previous snapshot
+public record VersionEntry(
+    ArtNode<VertexData> vertexRoot,
+    ArtNode<EdgeData> edgeRoot,
+    long lastAccessTimestamp,
+    ByteArray logFilePointer    // pointer to mutation log between snapshots
 ) {}
 
-public final class VersionMap<V, E> {
-    private final PersistentHAMT<SnapshotId, VersionRoot<V, E>> roots;
-
-    public GraphSnapshot<V, E> get(SnapshotId id) { /* O(1) lookup */ }
-    public SnapshotId commit(VersionRoot<V, E> root) { /* atomic insert */ }
-    public List<SnapshotId> range(SnapshotId prefix) { /* prefix scan */ }
-    public VersionRoot<V, E> branch(SnapshotId source) { /* copy root pair */ }
+public record ByteArray(byte[] data) implements Comparable<ByteArray> {
+    // Value-based equality, hashCode, compareTo (lexicographic)
 }
 ```
 
-### 7.3 Edge Key Design
+#### 4.2.2 Vertex and Edge Data Model
 
-Following the paper (Section 5.2), edge keys are composite byte arrays enabling prefix-based retrieval:
+The paper uses the property graph model (§3): *"Tegra uses the popular property graph model [26], where vertices and edges in the graph are associated with arbitrary properties."*
 
 ```java
-/**
- * Edge key layout (16 bytes):
- *   bytes 0-7:  source vertex ID (long, big-endian)
- *   bytes 8-15: destination vertex ID (long, big-endian)
- *
- * This layout enables:
- *   - prefix(8 bytes) → all outgoing edges from a source vertex
- *   - full key → specific edge lookup
- *   - range(srcA, srcB) → all edges from vertices in range
- *
- * For multigraphs, extend to 18 bytes with a 2-byte discriminator.
- */
-public record EdgeId(long src, long dst, short discriminator) {
-    public byte[] toKey() {
-        byte[] key = new byte[18];
-        ByteBuffer.wrap(key)
-            .putLong(src)
-            .putLong(dst)
-            .putShort(discriminator);
-        return key;
-    }
+public record VertexData(
+    long id,
+    PropertyMap properties
+) {}
+
+public record EdgeData(
+    long srcId,
+    long dstId,
+    short discriminator,
+    PropertyMap properties
+) {}
+
+public final class PropertyMap {
+    // Backed by a persistent HAMT or small array for few properties
+    // Supports primitive values without boxing via tagged union
+    public PropertyMap put(String key, PropertyValue value);
+    public PropertyValue get(String key);
+    public PropertyMap remove(String key);
+    public int size();
+    public Iterator<Map.Entry<String, PropertyValue>> iterator();
+}
+
+public sealed interface PropertyValue
+    permits LongProperty, DoubleProperty, StringProperty, BoolProperty,
+            ByteArrayProperty, ListProperty, MapProperty {}
+```
+
+The paper notes: *"Tegra creates default properties at vertices and edges to allow queries that compute on them."* Default properties are initialized during graph loading.
+
+#### 4.2.3 Version Management
+
+**Paper reference**: §5.3
+
+The paper specifies two primitives:
+
+**branch(versionId) → WorkingVersion**
+- Creates a new transient root pointing to the same children as the source version's root (§5.3).
+- The working version is exclusive to the caller — not visible in the system.
+- Mutations on the working version use in-place updates (not path-copying) until commit.
+- If the source version is on disk, it is first materialized.
+
+**commit(workingVersion, newVersionId) → versionId**
+- Freezes the working version by making it persistent.
+- Adds the new root pair to the version map.
+- Increments reference counts on all nodes reachable from the new roots.
+- Aggressively removes transient nodes created during the branch-commit window.
+- Stores a pointer to the mutation log (raw mutations between this snapshot and the previous) in the version entry.
+
+```java
+public final class WorkingVersion {
+    private ArtNode<VertexData> vertexRoot;   // mutable reference
+    private ArtNode<EdgeData> edgeRoot;       // mutable reference
+    private final ByteArray sourceVersionId;
+
+    public void putVertex(long vertexId, VertexData data);
+    public void removeVertex(long vertexId);
+    public void putEdge(long srcId, long dstId, short disc, EdgeData data);
+    public void removeEdge(long srcId, long dstId, short disc);
+    public VertexData getVertex(long vertexId);
+    public EdgeData getEdge(long srcId, long dstId, short disc);
+
+    // Iterator over all outgoing edges of a vertex (prefix match on srcId)
+    public Iterator<EdgeData> outEdges(long vertexId);
 }
 ```
 
-The ART's prefix matching capability makes "retrieve all outgoing edges of vertex X" a prefix scan on the first 8 bytes — O(outDegree) with no full-tree scan.
+#### 4.2.4 Version ID Scheme and Matching
 
-### 7.4 Snapshot Lifecycle
+**Paper reference**: §5.3.1
+
+Version IDs are byte arrays with a hierarchical naming convention:
 
 ```
-                    ┌─────────────┐
-                    │  No Version  │
-                    └──────┬──────┘
-                           │ branch(existingId) or initial load
-                           ▼
-                    ┌─────────────┐
-                    │  TRANSIENT   │  ← mutable, not visible to others
-                    │  (working)   │    in-place updates via MutationContext
-                    └──────┬──────┘
-                           │ commit(id)
-                           ▼
-                    ┌─────────────┐
-                    │  COMMITTED   │  ← immutable, visible, in-memory
-                    │  (active)    │    fully materialized, fast access
-                    └──────┬──────┘
-                           │ LRU timeout or memory pressure
-                           ▼
-                    ┌─────────────┐
-                    │   EVICTED    │  ← serialized subtrees on disk
-                    │   (cold)     │    roots still in-memory (small)
-                    └──────┬──────┘
-                           │ retrieve(id) — demand-load
-                           ▼
-                    ┌─────────────┐
-                    │  COMMITTED   │  ← re-materialized from disk
-                    │  (warm)      │
-                    └─────────────┘
+{GRAPH_ID}_{UNIX_TIMESTAMP}                          → graph snapshot
+{GRAPH_ID}_{UNIX_TIMESTAMP}_{ALGO_ID}_{ITERATION}    → computation state
 ```
 
-### 7.5 Commit Protocol (Single-Node)
+Example: `TWTR_1577869200_PR_3` = Twitter graph, timestamp 1577869200, PageRank iteration 3.
+
+DGSI supports matching primitives on version IDs:
+
+- **Prefix matching**: All IDs starting with a prefix. Example: `TWTR_` returns all Twitter snapshots.
+- **Suffix matching**: All IDs ending with a suffix.
+- **Range matching**: All IDs in a lexicographic range [start, end).
 
 ```java
-public SnapshotId commit(MutableGraphView<V, E> working) {
-    // 1. Finalize the mutation context (freeze in-place mutations)
-    working.mutationContext().freeze();
-
-    // 2. The working view's tree roots ARE the new version
-    //    (path-copying already happened during mutations)
-    var root = new VersionRoot<>(
-        working.vertexRoot(),
-        working.edgeRoot(),
-        Instant.now(),
-        mutationLog.currentOffset()
-    );
-
-    // 3. Generate snapshot ID
-    var id = idGenerator.next(working.graphId());
-
-    // 4. Atomic insert into version map
-    versions.put(id, root);
-
-    // 5. Update eviction tracking
-    eviction.onAccess(id);
-
-    return id;
+public interface VersionIndex {
+    VersionEntry get(ByteArray id);
+    List<ByteArray> matchPrefix(ByteArray prefix);
+    List<ByteArray> matchSuffix(ByteArray suffix);
+    List<ByteArray> matchRange(ByteArray start, ByteArray end);
+    void put(ByteArray id, VersionEntry entry);
+    void remove(ByteArray id);
 }
 ```
 
-### 7.6 Distributed Commit Protocol
-
-For distributed deployments, all partitions must commit at the same logical time to ensure a consistent distributed snapshot. We implement a two-phase barrier:
-
-```
-Coordinator                 Partition 1    Partition 2    Partition N
-    │                           │              │              │
-    │── PREPARE_COMMIT(batchId)──►              │              │
-    │                           │──PREPARE_COMMIT──►           │
-    │                           │              │──PREPARE_COMMIT──►
-    │                           │              │              │
-    │◄── READY(localRoot) ──────│              │              │
-    │◄── READY(localRoot) ─────────────────────│              │
-    │◄── READY(localRoot) ────────────────────────────────────│
-    │                           │              │              │
-    │   (all partitions ready)  │              │              │
-    │                           │              │              │
-    │── COMMIT(snapshotId) ─────►              │              │
-    │                           │── COMMIT ────►              │
-    │                           │              │── COMMIT ────►
-    │                           │              │              │
-    │◄── ACK ───────────────────│              │              │
-    │◄── ACK ──────────────────────────────────│              │
-    │◄── ACK ─────────────────────────────────────────────────│
-```
-
-Implemented using structured concurrency:
+The paper also handles automatic ID generation for time-based snapshots and computation iterations (§5.3.1):
 
 ```java
-public SnapshotId distributedCommit(BatchId batchId) throws Exception {
-    var id = idGenerator.next(graphId);
+public final class VersionIdGenerator {
+    public static ByteArray graphSnapshot(String graphId, long unixTimestamp);
+    public static ByteArray computationIteration(
+        ByteArray snapshotId, String algorithmId, int iteration);
+    public static ByteArray branch(ByteArray sourceId, String branchName);
+}
+```
 
-    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-        // Fork one virtual thread per partition
-        List<Subtask<VersionRoot>> tasks = partitions.stream()
-            .map(p -> scope.fork(() -> p.prepareCommit(batchId)))
-            .toList();
+#### 4.2.5 GraphView (Read-Only Snapshot Access)
 
-        scope.join();           // Wait for all partitions
-        scope.throwIfFailed();  // Propagate first failure
+When a version is retrieved, DGSI returns a read-only view backed by the pART roots:
 
-        // All prepared — now commit atomically
-        for (int i = 0; i < partitions.size(); i++) {
-            partitions.get(i).finalizeCommit(id, tasks.get(i).get());
-        }
-    }
-    return id;
+```java
+public final class GraphView {
+    private final ArtNode<VertexData> vertexRoot;
+    private final ArtNode<EdgeData> edgeRoot;
+    private final ByteArray versionId;
+
+    public VertexData vertex(long vertexId);
+    public EdgeData edge(long srcId, long dstId, short disc);
+    public Iterator<VertexData> vertices();
+    public Iterator<EdgeData> edges();
+    public Iterator<EdgeData> outEdges(long vertexId);    // prefix match
+    public Iterator<EdgeData> inEdges(long vertexId);     // requires reverse index or scan
+    public long vertexCount();
+    public long edgeCount();
+}
+```
+
+Since snapshots are immutable and backed by persistent data structures, multiple threads can concurrently read different (or the same) snapshots without synchronization. This is a key property enabling parallel computation across snapshots (§3.1, Figure 10).
+
+#### 4.2.6 Memory Management
+
+**Paper reference**: §5.4
+
+**LRU Eviction**:
+- Each version access updates a `lastAccessTimestamp` in the version entry.
+- A background thread (virtual thread) periodically scans the version map and evicts versions whose `lastAccessTimestamp` falls below a threshold.
+- Eviction serializes unique subtrees to disk files. Shared nodes across versions share disk files.
+- Evicted nodes are replaced by `DiskPointer` references in the tree.
+
+```java
+public final class LruEvictionManager {
+    private final long evictionIntervalMs;
+    private final long accessThresholdMs;
+    private final DiskStore diskStore;
+    private final Thread evictionThread;  // virtual thread
+
+    public void start();
+    public void stop();
+    public void touchVersion(ByteArray versionId);
+    void evictVersion(ByteArray versionId);
+    void materializeVersion(ByteArray versionId);
+}
+```
+
+**Disk Storage for Evicted Subtrees**:
+
+```java
+public sealed interface ArtNode<V>
+    permits Node4, Node16, Node48, Node256, Leaf, DiskNode {
+    // DiskNode is a lazy-loading placeholder
+}
+
+public final class DiskNode<V> implements ArtNode<V> {
+    private final DiskPointer pointer;
+    private volatile ArtNode<V> materialized;  // loaded on demand
+
+    // All operations first materialize from disk, then delegate
+}
+
+public record DiskPointer(Path filePath, long offset, int length) {}
+```
+
+The paper states (§5.4): *"Since every version in DGSI is a branch, we write each subtree in that branch to a separate file and then point its root to the file identifier. By writing subtrees to separate files, we ensure that different versions sharing tree nodes in memory can share tree nodes written to files."*
+
+**Orphan Cleanup**:
+The paper states: *"during ad-hoc analysis, analysts are likely to create versions that are never committed. We periodically mark such orphans and adjust the reference counting."*
+
+A background task scans for `WorkingVersion` instances that have not been committed within a configurable timeout and reclaims their resources.
+
+**Reference Counting Mechanics**:
+
+```java
+public final class RefCountManager {
+    public void increment(ArtNode<?> node);
+    public void decrement(ArtNode<?> node);
+    public void decrementSubtree(ArtNode<?> root);  // for version eviction
+}
+```
+
+When a version is evicted via `evict(versionId)`:
+1. Remove the root pair from the version map.
+2. Walk the tree from the root, decrementing refCounts.
+3. For nodes that reach refCount=0 and are not shared: serialize to disk or free.
+4. For nodes that are shared (refCount > 0 after decrement): leave in memory.
+
+#### 4.2.7 Mutation Log
+
+The paper states (§5.3): *"In order to be able to retrieve the state of the graph in between snapshots, Tegra stores the updates between snapshots in a simple log file, and adds a pointer to this file to the root."*
+
+```java
+public final class MutationLog {
+    private final Path logDirectory;
+
+    public MutationLogWriter openWriter(ByteArray versionId);
+    public MutationLogReader openReader(ByteArray versionId);
+}
+
+public sealed interface GraphMutation
+    permits AddVertex, RemoveVertex, UpdateVertexProperty,
+            AddEdge, RemoveEdge, UpdateEdgeProperty {}
+```
+
+The mutation log enables reconstructing intermediate states between committed snapshots if needed. It is append-only and immutable once the next snapshot is committed.
+
+#### 4.2.8 Graph Import/Export
+
+The paper states (§5.3): *"Tegra can interface with external graph stores, such as Neo4J or Titan for importing and exporting graphs."*
+
+We define an SPI (Service Provider Interface) for graph import/export:
+
+```java
+public interface GraphImporter {
+    void importGraph(GraphSource source, PartitionStore store, ByteArray versionId);
+}
+
+public interface GraphExporter {
+    void exportGraph(GraphView view, GraphSink sink);
+}
+
+public interface GraphSource {
+    Iterator<VertexData> vertices();
+    Iterator<EdgeData> edges();
+}
+```
+
+Built-in importers: edge-list files (TSV/CSV), adjacency list format. External store connectors (Neo4J, etc.) are out of scope for the core system but pluggable via SPI.
+
+---
+
+### 4.3 tegra-api: Timelapse Abstraction & API
+
+**Paper reference**: §3, Table 1
+
+#### 4.3.1 Core Timelapse API
+
+The paper defines five operations in Table 1:
+
+```java
+public final class Timelapse {
+    private final PartitionStore store;
+
+    /**
+     * Save the state of the graph as a snapshot in its timelapse.
+     * ID can be autogenerated. Returns the id of the saved snapshot.
+     * Internally calls DGSI commit.
+     */
+    public ByteArray save(ByteArray id);
+    public ByteArray save();  // auto-generated ID with timestamp
+
+    /**
+     * Return one or more snapshots from the timelapse.
+     * Allows simple matching on the id (prefix, range).
+     * Internally calls DGSI retrieve with version matching.
+     */
+    public Snapshot retrieve(ByteArray id);
+    public List<Snapshot> retrieve(ByteArray prefixOrRange);
+
+    /**
+     * Difference between two snapshots in the timelapse.
+     * Returns the set of changed vertex/edge IDs.
+     * Used by ICE for bootstrap and iteration (§4).
+     */
+    public Delta diff(Snapshot a, Snapshot b);
+
+    /**
+     * Given a list of candidate vertices, expand the computation scope
+     * by marking their 1-hop neighbors.
+     * Used for implementing incremental computations (§4).
+     */
+    public SubgraphView expand(Set<Long> candidates, Snapshot snapshot);
+
+    /**
+     * Create a new snapshot using the union of vertices and edges
+     * of two snapshots. For common vertices, run func to compute their value.
+     * Used for implementing incremental computations (§4).
+     */
+    public Snapshot merge(Snapshot a, Snapshot b, MergeFunction func);
+}
+```
+
+#### 4.3.2 Snapshot
+
+```java
+public final class Snapshot {
+    private final GraphView graphView;
+    private final ByteArray versionId;
+    private final Timelapse timelapse;
+
+    public GraphView graph();
+    public ByteArray id();
+
+    // Snapshot-aware graph operators (§6.2):
+    // "It extends all the operators to operate on user-specified snapshot(s)"
+    public Iterator<VertexData> vertices();
+    public Iterator<EdgeData> edges();
+    public <R> Snapshot mapVertices(Function<VertexData, R> fn);
+    public <R> Snapshot mapEdges(Function<EdgeData, R> fn);
+}
+```
+
+#### 4.3.3 Delta (Diff Result)
+
+```java
+public record Delta(
+    Set<Long> addedVertices,
+    Set<Long> removedVertices,
+    Set<Long> modifiedVertices,
+    Set<EdgeKey> addedEdges,
+    Set<EdgeKey> removedEdges,
+    Set<EdgeKey> modifiedEdges
+) {
+    /**
+     * Returns the set of all "affected" vertex IDs:
+     * added, removed, modified vertices, plus source/destination
+     * vertices of added, removed, modified edges.
+     */
+    public Set<Long> affectedVertices();
+}
+```
+
+The diff operation walks both pART trees concurrently, comparing shared vs. divergent subtrees. Since persistent data structures use structural sharing, shared subtrees (same object reference) can be skipped entirely — only divergent subtrees need comparison.
+
+```java
+public final class PersistentDiff {
+    /**
+     * Efficient diff exploiting structural sharing.
+     * If two subtree roots are the same object reference, skip.
+     * Only recurse into subtrees that differ.
+     * Returns the set of keys that differ.
+     */
+    public static <V> Set<byte[]> diff(ArtNode<V> rootA, ArtNode<V> rootB);
+}
+```
+
+#### 4.3.4 SubgraphView (Expand Result)
+
+```java
+public final class SubgraphView {
+    private final Set<Long> activeVertices;      // vertices that must recompute
+    private final Set<Long> boundaryVertices;    // 1-hop neighbors (for gather)
+    private final GraphView backingGraph;
+
+    public boolean isActive(long vertexId);
+    public boolean isBoundary(long vertexId);
+    public Iterator<VertexData> activeVertices();
+    public Iterator<VertexData> boundaryVertices();
+    public Iterator<EdgeData> relevantEdges();
+}
+```
+
+#### 4.3.5 MergeFunction
+
+```java
+@FunctionalInterface
+public interface MergeFunction {
+    /**
+     * For a vertex present in both snapshots, compute the merged value.
+     * Used by ICE to copy state from previous computation for
+     * vertices that did not recompute.
+     */
+    VertexData merge(VertexData fromA, VertexData fromB);
+}
+```
+
+#### 4.3.6 Timelapse Creation and Lineage
+
+The paper states (§3): *"Timelapses are created in Tegra in two ways — by the system and by the users."*
+
+- **System-created**: When a new graph is introduced, a timelapse is created with a single snapshot. As the graph evolves, snapshots are added.
+- **User-created**: During analytics, operations on snapshots create new snapshots. These may be added to existing timelapses or create new ones.
+- **Lineage tracking**: The system tracks parent-child relationships between snapshots across timelapses.
+
+```java
+public final class TimelapseManager {
+    private final PartitionStore store;
+    private final Map<String, Timelapse> timelapses;
+
+    public Timelapse create(String graphId);
+    public Timelapse get(String graphId);
+    public Timelapse branch(ByteArray snapshotId, String branchName);
+    public LineageGraph lineage();
+}
+```
+
+#### 4.3.7 Snapshot-Aware Graph Operators
+
+**Paper reference**: §6.2
+
+The paper states: *"It extends all the operators to operate on user-specified snapshot(s) (e.g., Graph.vertices(id) retrieves vertices at a given snapshot id, and Graph.mapV([ids]) can apply a map function on vertices of the graph on a set of snapshots)."*
+
+```java
+public final class TegraGraph {
+    private final TimelapseManager manager;
+
+    // Single-snapshot operators
+    public Iterator<VertexData> vertices(ByteArray snapshotId);
+    public Iterator<EdgeData> edges(ByteArray snapshotId);
+
+    // Multi-snapshot operators (§3.1)
+    // Enables temporal queries across multiple snapshots
+    public <R> Map<ByteArray, R> mapVertices(
+        List<ByteArray> snapshotIds, Function<VertexData, R> fn);
+
+    // Graph-parallel computation on single snapshot
+    public <M> Snapshot aggregateMessages(
+        ByteArray snapshotId,
+        SendMessageFunction<M> sendMsg,
+        MergeMessageFunction<M> mergeMsg);
+
+    // Graph-parallel computation across snapshots (§3.1)
+    // "each processing phase is able to see the history of the node's property changes"
+    public <M> Map<ByteArray, Snapshot> aggregateMessages(
+        List<ByteArray> snapshotIds,
+        SendMessageFunction<M> sendMsg,
+        MergeMessageFunction<M> mergeMsg);
 }
 ```
 
 ---
 
-## 8. Component 3: Timelapse API (tegra-api)
+### 4.4 tegra-compute: ICE Computation Model & GAS Engine
 
-### 8.1 Core Types
+**Paper reference**: §4, §6.1, Listing 1
 
-```java
-/**
- * A Timelapse represents the evolution of a graph over time.
- * It is the primary user-facing abstraction in Tegra-J.
- *
- * @param <V> vertex property type
- * @param <E> edge property type
- */
-public final class Timelapse<V, E> implements Iterable<GraphSnapshot<V, E>> {
+#### 4.4.1 GAS (Gather-Apply-Scatter) Engine
 
-    /** Save the current graph state as a new snapshot. */
-    public SnapshotId save(String id);
+**Paper reference**: §2.1, §6.1
 
-    /** Retrieve a snapshot by exact ID. */
-    public GraphSnapshot<V, E> retrieve(SnapshotId id);
-
-    /** Retrieve snapshots matching a prefix (e.g., "TWTR_15778"). */
-    public List<GraphSnapshot<V, E>> retrieve(String prefix);
-
-    /** Retrieve snapshots in a range. */
-    public List<GraphSnapshot<V, E>> range(SnapshotId from, SnapshotId to);
-
-    /** Compute the difference between two snapshots. */
-    public GraphDelta<V, E> diff(SnapshotId a, SnapshotId b);
-
-    /** Branch from an existing snapshot for what-if analysis. */
-    public MutableGraphView<V, E> branch(SnapshotId source);
-
-    /** Run an algorithm on a single snapshot. */
-    public <R> R run(SnapshotId id, GraphAlgorithm<V, E, R> algorithm);
-
-    /** Run an algorithm across multiple snapshots in parallel. */
-    public <R> Map<SnapshotId, R> map(
-        List<SnapshotId> snapshots,
-        GraphAlgorithm<V, E, R> algorithm);
-
-    /** Sliding window query. */
-    public <R> List<R> window(
-        SnapshotId start, SnapshotId end,
-        Duration stride, GraphAlgorithm<V, E, R> algorithm);
-
-    /** Run an algorithm incrementally (ICE) across a snapshot sequence. */
-    public <R> Map<SnapshotId, R> mapIncremental(
-        List<SnapshotId> snapshots,
-        GraphAlgorithm<V, E, R> algorithm);
-}
-```
-
-### 8.2 Snapshot ID Convention
-
-Following the paper's hierarchical naming scheme:
-
-```
-Format: {GRAPH_ID}_{UNIX_EPOCH}[_{ALGO_ID}_{ITERATION}]
-
-Examples:
-  TWTR_1577869200                    — Graph snapshot at 9:00 AM
-  TWTR_1577869200_PR_1               — PageRank iteration 1 on that snapshot
-  TWTR_1577869200_PR_2               — PageRank iteration 2
-  TWTR_1577872800                    — Graph snapshot at 10:00 AM
-  TWTR_1577872800_CC_1               — Connected Components iteration 1
-
-Queries:
-  retrieve("TWTR_")                  — All snapshots of the Twitter graph
-  retrieve("TWTR_1577869200_PR_")    — All PageRank iterations on the 9 AM snapshot
-  range("TWTR_1577869200", "TWTR_1577872800") — All snapshots between 9-10 AM
-```
+The GAS model (PowerGraph [27]) decomposes vertex programs into three phases:
 
 ```java
-public record SnapshotId(byte[] raw) implements Comparable<SnapshotId> {
-
-    public static SnapshotId of(String graphId, Instant timestamp) {
-        return new SnapshotId(
-            (graphId + "_" + timestamp.getEpochSecond()).getBytes(UTF_8));
-    }
-
-    public static SnapshotId ofIteration(SnapshotId base, String algoId, int iter) {
-        return new SnapshotId(
-            (new String(base.raw, UTF_8) + "_" + algoId + "_" + iter)
-                .getBytes(UTF_8));
-    }
-
-    public boolean hasPrefix(SnapshotId prefix) {
-        return Arrays.mismatch(raw, prefix.raw) >= prefix.raw.length;
-    }
-
-    @Override
-    public int compareTo(SnapshotId other) {
-        return Arrays.compare(raw, other.raw);
-    }
-}
-```
-
-### 8.3 Graph Snapshot (Immutable View)
-
-```java
-public sealed interface GraphView<V, E>
-    permits GraphSnapshot, MutableGraphView {
-
-    long vertexCount();
-    long edgeCount();
-    Optional<Vertex<V>> vertex(long id);
-    Stream<Vertex<V>> vertices();
-    Stream<Edge<E>> outEdges(long vertexId);
-    Stream<Edge<E>> inEdges(long vertexId);
-    Stream<Edge<E>> edges();
-}
-
-/**
- * An immutable, point-in-time view of the graph.
- * Thread-safe; zero-copy (backed by persistent tree traversal).
- */
-public final class GraphSnapshot<V, E> implements GraphView<V, E> {
-    private final ArtNode<VertexData<V>> vertexRoot;
-    private final ArtNode<EdgeData<E>> edgeRoot;
-    private final SnapshotId id;
-    // No mutation methods. Compile-time guarantee of immutability.
-}
-
-/**
- * A mutable working copy created via branch().
- * Not thread-safe; must be used by a single thread or under external sync.
- */
-public final class MutableGraphView<V, E> implements GraphView<V, E> {
-    public void addVertex(long id, V properties);
-    public void removeVertex(long id);
-    public void addEdge(long src, long dst, E properties);
-    public void removeEdge(long src, long dst);
-    public void setVertexProperty(long id, V properties);
-    public void setEdgeProperty(long src, long dst, E properties);
-}
-```
-
----
-
-## 9. Component 4: ICE Computation Engine (tegra-compute)
-
-### 9.1 GAS Framework
-
-The Gather-Apply-Scatter model from PowerGraph, adapted for Tegra's persistent snapshots:
-
-```java
-/**
- * A vertex program in the GAS model.
- * Implementations define the three phases of graph-parallel computation.
- *
- * @param <V> vertex value type
- * @param <E> edge value type
- * @param <M> message type (gathered/scattered between vertices)
- */
 public interface VertexProgram<V, E, M> {
 
-    /** Direction of edges to gather from. */
-    EdgeDirection gatherDirection();
+    /**
+     * Gather: collect information about adjacent vertices and edges
+     * and apply a function on them.
+     * @param context the edge triplet (src vertex, edge, dst vertex)
+     * @return a message, or null if no message to send
+     */
+    M gather(EdgeTriplet<V, E> context);
 
-    /** Direction of edges to scatter to. */
-    EdgeDirection scatterDirection();
-
-    /** Gather: compute a partial message from one edge. */
-    M gather(V vertexValue, E edgeValue, V neighborValue);
-
-    /** Sum: combine two gathered messages (associative, commutative). */
+    /**
+     * Sum: combine messages from gather phase.
+     * Associative and commutative.
+     */
     M sum(M a, M b);
 
-    /** Apply: update vertex value using the gathered message. */
-    V apply(V currentValue, M gathered);
-
-    /** Scatter: determine if a neighbor should be activated. */
-    boolean scatter(V updatedValue, V oldValue, E edgeValue);
-
-    /** Initial message for vertices with no incoming messages. */
-    M identity();
-
-    /** Convergence check. */
-    default boolean hasConverged(V oldValue, V newValue) {
-        return Objects.equals(oldValue, newValue);
-    }
-}
-```
-
-### 9.2 GAS Engine Execution (Single Snapshot)
-
-```java
-public final class GasEngine<V, E> {
-
-    public <M> GraphSnapshot<V, E> execute(
-            GraphSnapshot<V, E> snapshot,
-            VertexProgram<V, E, M> program,
-            int maxIterations,
-            Timelapse<V, E> stateTimelapse  // stores iteration states
-    ) {
-        var working = snapshot.asMutable();
-        Set<Long> activeVertices = allVertexIds(working);
-
-        for (int iter = 0; iter < maxIterations && !activeVertices.isEmpty(); iter++) {
-
-            // GATHER: For each active vertex, gather from neighbors
-            Map<Long, M> messages = gatherPhase(working, program, activeVertices);
-
-            // APPLY: Update vertex values
-            Set<Long> changedVertices = applyPhase(working, program, messages);
-
-            // SCATTER: Determine next active set
-            activeVertices = scatterPhase(working, program, changedVertices);
-
-            // Save iteration state to timelapse
-            if (stateTimelapse != null) {
-                stateTimelapse.save(
-                    SnapshotId.ofIteration(snapshot.id(), program.name(), iter));
-            }
-        }
-
-        return working.commit();
-    }
-}
-```
-
-### 9.3 ICE Engine (Incremental Computation)
-
-This is the core of Tegra's performance advantage. Implements Section 4.2 of the paper:
-
-```java
-public final class IceEngine<V, E> {
+    /**
+     * Apply: use the gathered/summed output to update the vertex value.
+     */
+    V apply(long vertexId, V currentValue, M gathered);
 
     /**
-     * Execute a vertex program incrementally on a new snapshot,
-     * using stored iteration states from a previous execution.
+     * Scatter: given the new vertex value, determine which neighbors
+     * should be activated in the next iteration.
+     * @return set of neighbor IDs to activate, or empty to deactivate
      */
-    public <M> GraphSnapshot<V, E> executeIncremental(
-            GraphSnapshot<V, E> newSnapshot,
-            VertexProgram<V, E, M> program,
-            Timelapse<V, E> previousStates,  // timelapse of previous execution
-            SwitchOracle switchOracle
-    ) {
-        // === BOOTSTRAP PHASE ===
-
-        // 1. Diff the new snapshot against the first stored iteration state
-        SnapshotId prevBaseId = previousStates.first().id();
-        GraphDelta<V, E> delta = newSnapshot.diff(previousStates.retrieve(prevBaseId));
-
-        // 2. Identify affected entities
-        Set<Long> affectedVertices = delta.changedVertexIds();
-        for (var edgeChange : delta.changedEdges()) {
-            affectedVertices.add(edgeChange.src());
-            affectedVertices.add(edgeChange.dst());
-        }
-
-        // 3. Expand to 1-hop neighborhood
-        Set<Long> subgraphVertices = expandOneHop(newSnapshot, affectedVertices);
-
-        // 4. Bootstrap: copy state from previous result for non-affected vertices
-        var working = newSnapshot.asMutable();
-        mergeState(working, previousStates.last(), subgraphVertices);
-
-        // === ITERATION PHASE ===
-
-        int iter = 0;
-        boolean converged = false;
-
-        while (!converged) {
-            // Check switch oracle — should we abandon incremental?
-            if (switchOracle.shouldSwitch(iter, subgraphVertices.size(),
-                    working.vertexCount(), program)) {
-                return gasEngine.execute(newSnapshot, program,
-                    program.maxIterations() - iter, null);
-            }
-
-            // Run GAS only on the subgraph
-            Map<Long, M> messages = gatherPhase(working, program, subgraphVertices);
-            Set<Long> changedVertices = applyPhase(working, program, messages);
-
-            // Diff against stored iteration state
-            SnapshotId prevIterationId =
-                SnapshotId.ofIteration(prevBaseId, program.name(), iter);
-
-            if (previousStates.has(prevIterationId)) {
-                GraphSnapshot<V, E> prevIteration =
-                    previousStates.retrieve(prevIterationId);
-
-                // Copy state for vertices NOT in subgraph from previous iteration
-                mergeState(working, prevIteration, subgraphVertices);
-
-                // Find new subgraph: diff current subgraph against stored state
-                GraphDelta<V, E> iterDelta = diffSubgraph(working, prevIteration);
-                Set<Long> newAffected = iterDelta.changedVertexIds();
-                subgraphVertices = expandOneHop(working, newAffected);
-            }
-
-            // Scatter to find next active set within subgraph
-            subgraphVertices = scatterPhase(working, program, changedVertices);
-
-            iter++;
-
-            // === TERMINATION CHECK ===
-            // Converged when: subgraph has no active vertices AND
-            // no entity needs state copied from stored snapshot
-            converged = subgraphVertices.isEmpty() &&
-                        (iter >= previousIterationCount || noStateToCopy(working, previousStates, iter));
-        }
-
-        return working.commit();
-    }
-}
-```
-
-### 9.4 Switch Oracle
-
-The paper uses a random forest classifier. We provide an SPI with a default heuristic-based implementation and an optional ML-based one:
-
-```java
-/**
- * Decides whether ICE should switch to full re-execution.
- * SPI interface — users can provide custom implementations.
- */
-public interface SwitchOracle {
-
-    boolean shouldSwitch(
-        int currentIteration,
-        int activeVertexCount,
-        long totalVertexCount,
-        VertexProgram<?, ?, ?> program
-    );
+    Set<Long> scatter(EdgeTriplet<V, E> context, V newValue);
 
     /**
-     * Default implementation: switch when active vertices exceed
-     * a dynamic threshold based on graph characteristics.
+     * Specifies which neighbors to gather from (IN, OUT, BOTH).
+     * Used by ICE diff() to determine affected vertices (§6.1).
      */
-    static SwitchOracle defaultOracle() {
-        return new HeuristicSwitchOracle();
-    }
+    EdgeDirection gatherNeighbors();
 
     /**
-     * Oracle based on pre-trained model.
-     * Loaded from a model file via SPI.
+     * Specifies which neighbors are activated by scatter (IN, OUT, BOTH).
+     * Used by ICE diff() to mark candidates for computation (§6.1).
      */
-    static SwitchOracle fromModel(Path modelPath) {
-        return new ModelBasedSwitchOracle(modelPath);
-    }
-}
-```
-
-### 9.5 Diff Engine
-
-The diff engine is the bridge between DGSI's structural sharing and ICE's incremental computation:
-
-```java
-public final class DiffEngine<V, E> {
-
-    /**
-     * Compute the structural difference between two snapshots.
-     * Leverages referential equality of shared subtrees for O(changes) complexity.
-     */
-    public GraphDelta<V, E> diff(GraphSnapshot<V, E> a, GraphSnapshot<V, E> b) {
-        var vertexDiff = a.vertexRoot().diff(b.vertexRoot());
-        var edgeDiff = a.edgeRoot().diff(b.edgeRoot());
-        return new GraphDelta<>(vertexDiff, edgeDiff);
-    }
+    EdgeDirection scatterNeighbors();
 }
 
-public record GraphDelta<V, E>(
-    List<DiffEntry<Long, VertexData<V>>> vertexChanges,
-    List<DiffEntry<byte[], EdgeData<E>>> edgeChanges
-) {
-    public Set<Long> changedVertexIds() { /* ... */ }
-    public Set<Long> affectedVertexIds() {
-        // Includes both endpoints of changed edges
-    }
-}
+public enum EdgeDirection { IN, OUT, BOTH }
 
-public record DiffEntry<K, V>(K key, V oldValue, V newValue, ChangeType type) {
-    public enum ChangeType { ADDED, REMOVED, MODIFIED }
-}
-```
-
----
-
-## 10. Component 5: Distribution Layer (tegra-cluster)
-
-### 10.1 Architecture
-
-Tegra-J's distribution layer is designed to be simpler and more lightweight than Spark:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     Coordinator Node                         │
-│  ┌─────────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ BarrierCoord    │  │ PartitionMap │  │ QueryRouter   │  │
-│  └─────────────────┘  └──────────────┘  └───────────────┘  │
-└──────────┬──────────────────┬──────────────────┬────────────┘
-           │                  │                  │
-     ┌─────▼──────┐    ┌─────▼──────┐    ┌─────▼──────┐
-     │ Worker 1   │    │ Worker 2   │    │ Worker N   │
-     │            │    │            │    │            │
-     │ Partition 0│    │ Partition 1│    │ Partition M│
-     │ DGSI local │    │ DGSI local │    │ DGSI local │
-     │ GAS local  │    │ GAS local  │    │ GAS local  │
-     │            │    │            │    │            │
-     │ VThread RPC│◄──►│ VThread RPC│◄──►│ VThread RPC│
-     └────────────┘    └────────────┘    └────────────┘
-```
-
-### 10.2 Partitioning Strategy
-
-```java
-public sealed interface Partitioner
-    permits HashPartitioner, TwoDPartitioner, CustomPartitioner {
-
-    /** Given a vertex ID, return the partition (worker) index. */
-    int partitionVertex(long vertexId);
-
-    /** Given an edge, return the partition(s) that store it. */
-    int[] partitionEdge(long srcId, long dstId);
-}
-
-/**
- * Default: consistent hashing on vertex ID.
- * Each vertex lives on exactly one partition.
- * Edges are stored on the source vertex's partition (for GAS gather efficiency).
- */
-public final class HashPartitioner implements Partitioner {
-    private final int numPartitions;
-
-    @Override
-    public int partitionVertex(long vertexId) {
-        return Long.hashCode(vertexId) % numPartitions;
-    }
-}
-```
-
-### 10.3 Virtual Thread RPC
-
-Each worker runs a virtual-thread-based RPC server. Cross-partition communication (needed for GAS gather/scatter on edges that span partitions) uses lightweight message passing:
-
-```java
-public final class VirtualThreadDispatcher {
-    private final ServerSocket server;
-    private final ExecutorService vthreadPool =
-        Executors.newVirtualThreadPerTaskExecutor();
-
-    public void start() {
-        vthreadPool.submit(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                Socket conn = server.accept();
-                // Each connection handled by a virtual thread
-                vthreadPool.submit(() -> handleConnection(conn));
-            }
-        });
-    }
-
-    private void handleConnection(Socket conn) {
-        // Deserialize message, dispatch to local DGSI/GAS, send response
-        // Virtual threads can block on I/O without thread pool exhaustion
-    }
-}
-```
-
-### 10.4 Distributed GAS Execution
-
-```
-Superstep N:
-  1. Each partition runs GATHER locally for its vertices
-     - For cross-partition edges: send GatherRequest to remote partition
-     - Remote partition responds with neighbor vertex value
-     - Virtual thread blocks on response (cheap with virtual threads)
-
-  2. Each partition runs APPLY locally (purely local)
-
-  3. Each partition runs SCATTER locally
-     - For cross-partition edges: send updated vertex value to remote
-     - Remote partition queues the value for next superstep's gather
-
-  4. Barrier: all partitions report active vertex count
-     - If global active count == 0 → converged
-     - Else → next superstep
-```
-
-### 10.5 Distributed ICE
-
-Cross-partition ICE requires one additional round of communication: the 1-hop neighborhood expansion may cross partition boundaries.
-
-```
-Bootstrap:
-  1. Each partition computes local diff
-  2. For vertices whose 1-hop neighbors are on other partitions:
-     send EXPAND_REQUEST to those partitions
-  3. Remote partitions include those vertices in their subgraph
-  4. Proceed with local ICE computation
-
-Iterations:
-  Same as single-node ICE, but scatter/gather cross partition boundaries
-  using the same RPC mechanism as distributed GAS.
-```
-
----
-
-## 11. Component 6: Serialization & Disk Eviction (tegra-serde)
-
-### 11.1 Binary Format
-
-We use a custom binary format (not JSON, not Protobuf) optimized for ART/HAMT subtree serialization:
-
-```
-File format: .tsnap (Tegra Snapshot)
-
-Header (32 bytes):
-  magic:     4 bytes  "TSNP"
-  version:   2 bytes  format version
-  flags:     2 bytes  (compressed, encrypted, etc.)
-  nodeCount: 8 bytes  number of nodes in this subtree
-  rootType:  1 byte   node type of the root
-  keyLen:    1 byte   key length (for ART)
-  reserved:  14 bytes
-
-Node entries (variable length, sequential):
-  Each node:
-    type:     1 byte   (Node4=0, Node16=1, Node48=2, Node256=3, Leaf=4)
-    size:     4 bytes  total entry size
-    data:     variable (type-specific layout)
-
-  Node4 data:
-    count:    1 byte
-    prefix:   variable (prefixLen + prefix bytes)
-    keys:     count bytes
-    children: count * 8 bytes (file offsets to child entries)
-
-  Leaf data:
-    keyLen:   2 bytes
-    key:      keyLen bytes
-    valueLen: 4 bytes
-    value:    valueLen bytes
-```
-
-### 11.2 Memory-Mapped Loading
-
-Evicted snapshots are loaded on-demand using memory-mapped files:
-
-```java
-public final class MMapSnapshotLoader<V, E> {
-
-    public GraphSnapshot<V, E> load(SnapshotId id, Path file) {
-        // Memory-map the file — OS manages physical memory paging
-        try (var arena = Arena.ofShared()) {
-            var channel = FileChannel.open(file, READ);
-            var mapped = channel.map(MapMode.READ_ONLY, 0, channel.size(), arena);
-
-            // Reconstruct tree from mapped memory
-            // Nodes reference memory-mapped segments, no deserialization needed
-            var root = reconstructTree(mapped);
-            return new GraphSnapshot<>(root.vertexRoot(), root.edgeRoot(), id);
-        }
-    }
-}
-```
-
-This means evicted snapshots can be accessed with zero deserialization overhead — the OS pages in file data on demand via the page cache.
-
-### 11.3 Tiered Eviction
-
-```
-Tier 0: Java Heap (small objects, vertex properties, metadata)
-        Access: nanoseconds
-        Size: limited by -Xmx
-
-Tier 1: Off-Heap Direct Memory (tree nodes, structural data)
-        Access: nanoseconds (same as heap, no GC)
-        Size: limited by physical RAM
-
-Tier 2: Memory-Mapped Files (evicted snapshots)
-        Access: microseconds (page fault on first access)
-        Size: limited by local disk
-
-Tier 3: Distributed File System (archived snapshots, HDFS/S3)
-        Access: milliseconds
-        Size: unlimited
-```
-
-```java
-public interface EvictionPolicy {
-    /** Decide which snapshots to evict from the current tier. */
-    List<SnapshotId> selectForEviction(
-        Map<SnapshotId, EvictionMetadata> candidates,
-        long currentUsage, long maxUsage);
-}
-
-public record EvictionMetadata(
-    Instant lastAccessed,
-    long sizeBytes,
-    int accessCount,
-    int sharedNodeCount  // nodes shared with other versions
+public record EdgeTriplet<V, E>(
+    long srcId, V srcValue,
+    long dstId, V dstValue,
+    E edgeValue
 ) {}
 ```
 
----
+#### 4.4.2 GAS Execution Engine
 
-## 12. GAS Engine & Built-in Algorithms (tegra-algorithms)
-
-### 12.1 PageRank
+The engine iteratively applies GAS phases on a graph snapshot until convergence:
 
 ```java
-public final class PageRank<E> implements VertexProgram<Double, E, Double> {
+public final class GasEngine {
 
-    private final double dampingFactor;
-    private final double tolerance;
-    private final int maxIterations;
-
-    @Override
-    public EdgeDirection gatherDirection() { return EdgeDirection.IN; }
-
-    @Override
-    public EdgeDirection scatterDirection() { return EdgeDirection.OUT; }
-
-    @Override
-    public Double gather(Double vertexValue, E edgeValue, Double neighborValue) {
-        // Neighbor contributes its rank divided by its out-degree
-        return neighborValue; // out-degree normalization done in apply
-    }
-
-    @Override
-    public Double sum(Double a, Double b) { return a + b; }
-
-    @Override
-    public Double apply(Double currentValue, Double gathered) {
-        return (1.0 - dampingFactor) + dampingFactor * gathered;
-    }
-
-    @Override
-    public boolean scatter(Double updatedValue, Double oldValue, E edgeValue) {
-        return Math.abs(updatedValue - oldValue) > tolerance;
-    }
-
-    @Override
-    public Double identity() { return 0.0; }
-
-    @Override
-    public boolean hasConverged(Double oldValue, Double newValue) {
-        return Math.abs(oldValue - newValue) < tolerance;
-    }
+    /**
+     * Execute a vertex program on a single snapshot until convergence.
+     * Stores intermediate iteration state in the timelapse (§4.2).
+     *
+     * @param snapshot the graph snapshot to compute on
+     * @param program the vertex program
+     * @param initialValues initial vertex values (or null for default)
+     * @param maxIterations maximum iterations before forced termination
+     * @param timelapse timelapse to store iteration state
+     * @param algorithmId algorithm identifier for version ID generation
+     * @return result snapshot with computed vertex values
+     */
+    public <V, E, M> Snapshot execute(
+        Snapshot snapshot,
+        VertexProgram<V, E, M> program,
+        Map<Long, V> initialValues,
+        int maxIterations,
+        Timelapse timelapse,
+        String algorithmId);
 }
 ```
 
-### 12.2 Connected Components (Label Propagation)
+Execution loop:
+1. Initialize all vertices with initial values or defaults.
+2. Mark all vertices as active.
+3. Repeat until no active vertices or maxIterations reached:
+   a. **Gather**: For each active vertex, gather from `gatherNeighbors()`.
+   b. **Sum**: Combine gathered messages per vertex.
+   c. **Apply**: Update vertex values.
+   d. **Scatter**: Determine next active set via `scatterNeighbors()`.
+   e. **Save**: Store iteration state as snapshot in timelapse: `{snapshotId}_{algoId}_{iteration}`.
+4. Return final result snapshot.
+
+#### 4.4.3 ICE: Incremental Computation by Entity Expansion
+
+**Paper reference**: §4.2
+
+ICE operates in four phases:
+
+**Phase 1 — Initial Execution**:
+When an algorithm runs for the first time, ICE uses the standard GAS engine. It stores the state of vertices (and edges if needed) as properties in the graph, and at the end of every iteration, saves a snapshot to the timelapse. The ID is generated as `{graphId}_{timestamp}_{algoId}_{iteration}`.
+
+**Phase 2 — Bootstrap**:
+When the computation runs on a new snapshot S_{n+1}, ICE bootstraps from S_n's stored results:
+1. Compute `delta = timelapse.diff(snapshot_n, snapshot_n_plus_1)`.
+2. Identify affected vertices: changed vertices + source/destination of changed edges.
+3. Mark `scatter_nbrs` of affected vertices as candidates (§6.1).
+4. Expand candidates to include `gather_nbrs` (via `timelapse.expand()`).
+5. This yields the subgraph on which GAS runs.
+
+**Phase 3 — Iterations**:
+At each iteration i:
+1. Run GAS on the subgraph.
+2. For vertices that did not recompute: copy state from `timelapse.retrieve({algoId}_{i})` (the stored iteration i from previous execution) via `timelapse.merge()`.
+3. Compare the subgraph result with the stored iteration i to find the new subgraph for iteration i+1.
+4. Expand the new affected set.
+
+**Phase 4 — Termination**:
+ICE terminates when BOTH conditions are met:
+1. The subgraph has converged (no vertex changed state).
+2. No entity needs its state copied from the stored timelapse snapshot (i.e., all stored iterations have been processed, or the remaining stored iterations match the current state).
+
+If the new snapshot requires MORE iterations than the initial execution, ICE switches to full (non-incremental) GAS from that point.
+If the new snapshot requires FEWER iterations, ICE still checks remaining stored iterations to copy state from.
 
 ```java
-public final class ConnectedComponents<E>
-        implements VertexProgram<Long, E, Long> {
+public final class IceEngine {
 
-    @Override
-    public EdgeDirection gatherDirection() { return EdgeDirection.BOTH; }
+    private final GasEngine gasEngine;
+    private final Timelapse timelapse;
 
-    @Override
-    public EdgeDirection scatterDirection() { return EdgeDirection.BOTH; }
-
-    @Override
-    public Long gather(Long vertexValue, E edgeValue, Long neighborValue) {
-        return neighborValue;
-    }
-
-    @Override
-    public Long sum(Long a, Long b) { return Math.min(a, b); }
-
-    @Override
-    public Long apply(Long currentValue, Long gathered) {
-        return Math.min(currentValue, gathered);
-    }
-
-    @Override
-    public boolean scatter(Long updatedValue, Long oldValue, E edgeValue) {
-        return !updatedValue.equals(oldValue);
-    }
-
-    @Override
-    public Long identity() { return Long.MAX_VALUE; }
+    /**
+     * Incremental Pregel implementation (Listing 1 from paper).
+     *
+     * @param graph the new graph snapshot to compute on
+     * @param prevResult the timelapse containing previous execution results
+     * @param program the vertex program
+     * @param maxIterations maximum iterations
+     * @return result snapshot
+     */
+    public <V, E, M> Snapshot incPregel(
+        Snapshot graph,
+        Timelapse prevResult,
+        VertexProgram<V, E, M> program,
+        int maxIterations);
 }
 ```
 
-### 12.3 Additional Algorithms
+The core loop, faithfully translated from Listing 1 in the paper:
 
-| Algorithm | Gather | Apply | Scatter | Notes |
-|-----------|--------|-------|---------|-------|
-| **BFS** | Min distance from neighbors | Min(current, gathered + 1) | Changed? | Single-source |
-| **SSSP** | Min (neighbor dist + edge weight) | Min(current, gathered) | Changed? | Dijkstra-like |
-| **TriangleCount** | Count common neighbors | Store count | Always | Set intersection |
-| **BeliefPropagation** | Product of incoming messages | Normalize | Always | Loopy BP |
-| **LabelPropagation** | Mode of neighbor labels | Adopt majority | Changed? | Community detection |
-| **k-Hop** | Union of neighbor hop sets | Add current vertex | Hops < k? | k-neighborhood |
-| **CollabFiltering** | Weighted neighbor ratings | Update latent factors | Always | ALS-based |
+```
+function IncPregel(g, prevResult, vprog, sendMsg, gather):
+    iter = 0
+    while not converged:
+        // Restrict to vertices that should recompute
+        msgs = g.expand(g.diff(prevResult.retrieve(iter)))
+                .aggregateMessages(sendMsg, gather)
+        iter += 1
+        // Receive messages and copy previous results
+        g = g.leftJoinV(msgs).mapV(vprog)
+             .merge(prevResult.retrieve(iter)).save(iter)
+    return g
+```
+
+#### 4.4.4 ICE on GAS Decomposition
+
+**Paper reference**: §6.1
+
+The diff() API in ICE uses `scatter_nbrs` to determine which vertices must recompute:
+
+1. Start with initial candidates (at bootstrap: graph changes; at iteration: candidates from previous iteration).
+2. For each candidate, if its state differs from the previous iteration or from the previous execution stored in the timelapse, mark all its `scatter_nbrs` for computation.
+3. A vertex addition inspects all its neighbors (as defined by `scatter_nbrs`) and includes them.
+
+The expand() API uses `gather_nbrs` to include necessary neighbors:
+
+1. For each candidate marked for recomputation, also mark its `gather_nbrs`.
+2. These neighbors provide correct input for the `gather()` phase but do not recompute their own state (they are "boundary" vertices in the SubgraphView).
+
+After diff and expand, Tegra has the complete subgraph for GAS computation.
+
+#### 4.4.5 Multi-Snapshot Parallel Computation
+
+**Paper reference**: §3.1, Figure 10
+
+The paper describes running the same algorithm on a sequence of snapshots in parallel:
+
+```java
+public final class ParallelSnapshotExecutor {
+
+    /**
+     * Execute algorithm on multiple snapshots in parallel.
+     * Uses virtual threads for concurrency.
+     * First snapshot: full execution.
+     * Subsequent snapshots: ICE incremental from the nearest computed result.
+     *
+     * Since snapshots are immutable and stored in DGSI,
+     * multiple ICE computations can run concurrently on different snapshots.
+     */
+    public <V, E, M> Map<ByteArray, Snapshot> executeParallel(
+        List<Snapshot> snapshots,
+        VertexProgram<V, E, M> program,
+        int maxIterations);
+}
+```
+
+The paper (§3.1) explains that each processing phase operates on the evolution of an entity: *"the user-defined vertex program is provided with state in all the snapshots. Thus, we are able to eliminate redundant messages and computation."*
+
+#### 4.4.6 Sharing State Across Queries
+
+**Paper reference**: §4.3
+
+The paper states: *"variants of connected components and pagerank algorithms both require the computation of vertex degree as one of the steps. Since ICE decouples state, such common computations can be stored as separate state that is shared across different queries."*
+
+ICE enables modular state composition. Common sub-computations (e.g., vertex degrees) are stored as separate timelapse entries and referenced by multiple algorithms:
+
+```java
+public final class SharedStateRegistry {
+    /**
+     * Register a computation result that can be shared across queries.
+     * Example: vertex degrees computed once, reused by PR and CC.
+     */
+    public void register(String computationId, ByteArray snapshotId);
+    public Snapshot retrieve(String computationId, ByteArray snapshotId);
+    public boolean exists(String computationId, ByteArray snapshotId);
+}
+```
+
+#### 4.4.7 Learning-Based Switching
+
+**Paper reference**: §4.3
+
+The paper describes a random forest classifier that decides, at iteration boundaries, whether to switch from incremental to full re-execution:
+
+> "We train a simple random forest classifier to predict, at the beginning of an iteration, if switching to full re-execution from that point would be faster compared to continuing with incremental execution."
+
+**Training features** (recorded per iteration during offline training):
+1. Number of vertices participating in computation
+2. Average degree of active vertices
+3. Number of partitions active
+4. Number of messages generated per vertex
+5. Number of messages received per vertex
+6. Amount of data transferred over the network
+7. Time taken for the iteration to complete
+
+**Graph-specific features**:
+8. Average degree of vertices
+9. Average diameter
+10. Clustering coefficient
+
+**Label**: Whether switching to full recomputation in the next iteration resulted in faster execution.
+
+```java
+public final class SwitchingClassifier {
+    private final RandomForestModel model;
+
+    /**
+     * Train the classifier offline using historical execution data.
+     */
+    public static SwitchingClassifier train(List<TrainingRecord> data);
+
+    /**
+     * Predict whether to switch to full re-execution at this iteration.
+     */
+    public boolean shouldSwitch(IterationMetrics metrics, GraphCharacteristics graphChars);
+
+    /**
+     * Load a pre-trained model from disk.
+     */
+    public static SwitchingClassifier load(Path modelPath);
+    public void save(Path modelPath);
+}
+
+public record IterationMetrics(
+    long activeVertexCount,
+    double avgDegreeOfActiveVertices,
+    int activePartitionCount,
+    double msgsGeneratedPerVertex,
+    double msgsReceivedPerVertex,
+    long networkBytesTransferred,
+    long iterationTimeMs
+) {}
+
+public record GraphCharacteristics(
+    double avgDegree,
+    double avgDiameter,
+    double clusteringCoefficient
+) {}
+
+public record TrainingRecord(
+    IterationMetrics metrics,
+    GraphCharacteristics graphChars,
+    boolean shouldSwitch  // label
+) {}
+```
+
+The random forest implementation can use a lightweight Java ML library or a self-contained implementation (no heavy dependencies for an OSS core module).
+
+#### 4.4.8 ICE Versatility: Monotonic Updates
+
+**Paper reference**: §7.3, Figure 12
+
+The paper notes: *"if updates are monotonic (only additions), then ICE can simply restart from the last answer instead of using full incremental computations."*
+
+```java
+public enum UpdateMonotonicity {
+    ADDITIONS_ONLY,   // can restart from last answer
+    DELETIONS_ONLY,
+    MIXED             // requires full ICE
+}
+```
+
+The ICE engine checks `UpdateMonotonicity` and uses the shortcut path for monotonic additions.
 
 ---
 
-## 13. Memory Management Strategy
+### 4.5 tegra-cluster: Distribution Layer
 
-### 13.1 Overview
+**Paper reference**: §5.2, §6
 
-The GC concern is addressed by a **hybrid memory model**:
+#### 4.5.1 Graph Partitioning
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Java Heap (ZGC managed)                   │
-│                                                             │
-│  ┌──────────────┐  ┌────────────┐  ┌─────────────────────┐ │
-│  │ VersionMap   │  │ API objects│  │ Computation state   │ │
-│  │ (small HAMT) │  │ (records)  │  │ (vertex values,     │ │
-│  │              │  │            │  │  messages, etc.)     │ │
-│  └──────────────┘  └────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+**Paper reference**: §5.2
 
-┌─────────────────────────────────────────────────────────────┐
-│               Off-Heap Direct Memory (Arena managed)         │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ ART/HAMT Tree Nodes                                  │   │
-│  │ (the bulk of memory: 80%+ of total usage)            │   │
-│  │                                                      │   │
-│  │ Reference counted. Freed when no version references  │   │
-│  │ the node. Not visible to GC. Zero pause overhead.    │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│           Memory-Mapped Files (OS page cache managed)        │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ Evicted snapshot subtrees                            │   │
-│  │ .tsnap files on local SSD                            │   │
-│  │ Paged in on-demand by OS; paged out under pressure   │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 13.2 Reference Counting for Off-Heap Nodes
-
-Since off-heap memory is not GC-managed, we use reference counting:
+The paper states: *"Tegra supports several graph partitioning schemes, similar to GraphX, to balance load and reduce communication. To distribute the graph across machines in the cluster, vertices are hash partitioned and edges are partitioned using one of many schemes."*
 
 ```java
-public abstract class RefCounted {
-    private final AtomicInteger refCount = new AtomicInteger(1);
-    private final OffHeapArena arena;
-    private final long offset;
+public interface PartitionStrategy {
+    int partitionForVertex(long vertexId, int numPartitions);
+    int partitionForEdge(long srcId, long dstId, int numPartitions);
+}
 
-    public void retain() {
-        refCount.incrementAndGet();
-    }
+// Implementations matching GraphX partition strategies:
+public final class HashPartitioning implements PartitionStrategy {
+    // vertex and edge assigned by hash of vertex ID
+}
 
-    public void release() {
-        if (refCount.decrementAndGet() == 0) {
-            arena.free(offset, size());
+public final class EdgePartition2D implements PartitionStrategy {
+    // 2D partitioning: edges assigned by (srcId mod sqrt(P), dstId mod sqrt(P))
+}
+
+public final class RandomVertexCut implements PartitionStrategy {
+    // edge assigned by hash of (srcId, dstId)
+}
+
+public final class CanonicalRandomVertexCut implements PartitionStrategy {
+    // edge assigned by hash of (min(srcId,dstId), max(srcId,dstId))
+}
+```
+
+The paper states: *"We do not partition the pART structures, instead Tegra partitions the graph and creates separate pART structures locally in each partition."*
+
+Each cluster node runs its own `PartitionStore` instance with independent pART trees.
+
+#### 4.5.2 Cluster Topology
+
+```java
+public final class ClusterManager {
+    private final List<NodeDescriptor> nodes;
+    private final PartitionStrategy strategy;
+    private final int numPartitions;
+    private final BarrierCoordinator barrierCoordinator;
+
+    public void start();
+    public void stop();
+    public NodeDescriptor nodeForPartition(int partitionId);
+    public int partitionForVertex(long vertexId);
+}
+
+public record NodeDescriptor(
+    String host,
+    int port,
+    int nodeId,
+    List<Integer> assignedPartitions
+) {}
+```
+
+#### 4.5.3 Distributed Snapshot Protocol (Barrier)
+
+**Paper reference**: §5.2
+
+The paper states: *"all machines must commit snapshots at the same logical time. Tegra uses a lightweight barrier for this — after ingesting a batch of mutations, all partitions commit simultaneously to create a consistent distributed snapshot."*
+
+```java
+public final class BarrierCoordinator {
+    /**
+     * Coordinate a distributed snapshot commit across all partitions.
+     * 1. Signal all partitions to prepare commit (flush pending mutations).
+     * 2. Wait for all partitions to acknowledge readiness.
+     * 3. Signal all partitions to commit with the same version ID.
+     * 4. Wait for all commits to complete.
+     */
+    public CompletableFuture<ByteArray> coordinateCommit(ByteArray versionId);
+}
+
+public interface PartitionNode {
+    /**
+     * Called by the coordinator to trigger local commit preparation.
+     */
+    void prepareCommit(ByteArray versionId);
+
+    /**
+     * Called by the coordinator to finalize the commit.
+     */
+    void commit(ByteArray versionId);
+}
+```
+
+#### 4.5.4 Distributed GAS Execution
+
+**Paper reference**: §6
+
+The paper states: *"We utilize the barrier execution mode to implement direct communication between tasks to avoid most Spark overheads."*
+
+In distributed GAS:
+- **Gather phase**: Local vertices gather from local neighbors directly. For remote neighbors (cross-partition edges), the vertex sends a request to the remote partition and receives the value.
+- **Apply phase**: Purely local.
+- **Scatter phase**: Sends updated values to remote partitions that hold neighbors needing activation.
+
+```java
+public final class DistributedGasEngine {
+    private final ClusterManager cluster;
+    private final MessageRouter messageRouter;
+
+    /**
+     * Execute a vertex program across all partitions.
+     * Synchronizes iterations using barriers.
+     */
+    public <V, E, M> Map<Integer, Snapshot> execute(
+        ByteArray snapshotId,
+        VertexProgram<V, E, M> program,
+        int maxIterations);
+}
+
+public final class MessageRouter {
+    /**
+     * Route GAS messages between partitions.
+     * Uses direct task-to-task communication (not shuffle).
+     */
+    public <M> void sendMessage(int targetPartition, long vertexId, M message);
+    public <M> Map<Long, M> receiveMessages(int partitionId);
+    public void barrier();  // synchronize all partitions at iteration boundary
+}
+```
+
+#### 4.5.5 Distributed ICE
+
+**Paper reference**: §4
+
+In distributed ICE:
+1. Each partition computes its local diff.
+2. Neighborhood expansion may cross partition boundaries. This requires one round of message passing to identify the full affected subgraph. A partition sends "expansion requests" for vertices that are remote, and receives back the neighbor lists.
+3. Each partition then runs ICE locally on its affected vertices, with cross-partition gather/scatter handled by the `MessageRouter`.
+
+```java
+public final class DistributedIceEngine {
+    private final DistributedGasEngine gasEngine;
+    private final ClusterManager cluster;
+    private final MessageRouter messageRouter;
+
+    public <V, E, M> Map<Integer, Snapshot> incPregel(
+        ByteArray snapshotId,
+        ByteArray prevResultId,
+        VertexProgram<V, E, M> program,
+        int maxIterations);
+}
+```
+
+#### 4.5.6 Update Ingestion and Routing
+
+The paper states (§5.2): *"To consume updates, Tegra needs to send the updates to the right partition. Here, we impose the same partitioning as the original graph on the vertices/edges in the update."*
+
+```java
+public final class UpdateIngestionRouter {
+    private final ClusterManager cluster;
+
+    /**
+     * Route a batch of mutations to their target partitions.
+     * Each partition applies mutations to its working version.
+     */
+    public void ingest(List<GraphMutation> mutations);
+
+    /**
+     * After ingestion, trigger coordinated commit across all partitions.
+     */
+    public ByteArray commitAll(ByteArray versionId);
+}
+```
+
+#### 4.5.7 Network Transport
+
+For inter-partition communication, we use a simple RPC framework based on Java NIO with virtual threads:
+
+```java
+public interface TransportServer {
+    void start(int port);
+    void stop();
+    void registerHandler(String method, RequestHandler handler);
+}
+
+public interface TransportClient {
+    CompletableFuture<byte[]> send(NodeDescriptor target, String method, byte[] payload);
+}
+```
+
+Messages are serialized using the `tegra-serde` module (§4.6).
+
+---
+
+### 4.6 tegra-serde: Serialization
+
+#### 4.6.1 Purpose
+
+Serialization is needed for two purposes in Tegra:
+1. **Disk eviction**: Writing pART subtrees to disk and reading them back (§5.4).
+2. **Network communication**: Serializing GAS messages and graph data for inter-partition transport.
+
+The paper warns against JSON. We use a compact binary format.
+
+#### 4.6.2 Binary Format
+
+```java
+public interface TegraSerializer<T> {
+    void serialize(T value, DataOutput out) throws IOException;
+    T deserialize(DataInput in) throws IOException;
+    int estimateSize(T value);
+}
+
+// Built-in serializers
+public final class ArtNodeSerializer<V> implements TegraSerializer<ArtNode<V>> { ... }
+public final class VertexDataSerializer implements TegraSerializer<VertexData> { ... }
+public final class EdgeDataSerializer implements TegraSerializer<EdgeData> { ... }
+public final class PropertyMapSerializer implements TegraSerializer<PropertyMap> { ... }
+public final class GasMessageSerializer<M> implements TegraSerializer<M> { ... }
+```
+
+#### 4.6.3 Subtree Serialization for Disk Eviction
+
+The paper specifies (§5.4) that subtrees are written to separate files, and versions sharing subtrees share files on disk.
+
+Each file contains a serialized subtree identified by its root node's identity hash. When writing a subtree:
+1. Compute a content hash for the subtree root.
+2. If a file with this hash already exists (shared by another version), skip writing.
+3. Otherwise, serialize the subtree depth-first to a binary file.
+4. Replace the in-memory subtree root with a `DiskNode` pointing to the file.
+
+Deserialization is lazy: `DiskNode.lookup()` triggers materialization of the subtree from disk on first access.
+
+#### 4.6.4 Adaptive Leaf Sizes
+
+The paper mentions (Figure 6 caption): *"Data structure uses adaptive leaf sizes for efficiency."*
+
+Leaves that store small property maps are serialized inline with their parent nodes. Leaves with large property maps are stored in separate files. The threshold is configurable.
+
+---
+
+### 4.7 tegra-algorithms: Graph Algorithms
+
+**Paper reference**: §7, Table 5
+
+The paper evaluates Tegra with the following algorithms, all implemented on the GAS model. Each algorithm is a `VertexProgram` implementation:
+
+#### 4.7.1 Connected Components (CC) — Label Propagation
+
+```java
+public final class ConnectedComponents implements VertexProgram<Long, Object, Long> {
+    // gather: min of neighbor labels
+    // apply: update label to min(current, gathered)
+    // scatter: activate neighbors if label changed
+    // Converges when no labels change
+}
+```
+
+The paper explicitly uses label propagation for CC (not union-find): *"DD uses a much superior union-find approach to CC while Tegra and GraphBolt use an iterative approach."*
+
+#### 4.7.2 PageRank (PR)
+
+```java
+public final class PageRank implements VertexProgram<Double, Object, Double> {
+    private final double dampingFactor;   // typically 0.85
+    private final double tolerance;       // convergence threshold
+    private final int maxIterations;      // paper: 20
+
+    // gather: sum of (neighbor_rank / neighbor_out_degree)
+    // apply: (1 - d) + d * gathered
+    // scatter: activate neighbors if rank changed > tolerance
+    // Paper: "run PR until specific convergence or 20 iterations, whichever is lower"
+}
+```
+
+#### 4.7.3 Belief Propagation (BP)
+
+```java
+public final class BeliefPropagation implements VertexProgram<double[], Object, double[]> {
+    // Generalized belief propagation (Yedidia et al., reference [74])
+    // gather: collect belief messages from neighbors
+    // apply: update beliefs using collected messages
+    // scatter: send updated beliefs to neighbors
+}
+```
+
+#### 4.7.4 Label Propagation (LP)
+
+```java
+public final class LabelPropagation implements VertexProgram<Long, Object, Map<Long, Long>> {
+    // gather: collect label frequencies from neighbors
+    // apply: adopt most frequent label
+    // scatter: activate neighbors if label changed
+}
+```
+
+#### 4.7.5 Collaborative Filtering (CF)
+
+```java
+public final class CollaborativeFiltering implements VertexProgram<double[], Double, double[]> {
+    private final int numFactors;
+    // ALS-style matrix factorization on bipartite graph
+    // gather: collect factor vectors from neighbors
+    // apply: solve least squares for this vertex's factors
+    // scatter: activate neighbors if factors changed significantly
+}
+```
+
+#### 4.7.6 Triangle Count (TC)
+
+```java
+public final class TriangleCount implements VertexProgram<Long, Object, Set<Long>> {
+    // gather: collect neighbor ID sets
+    // apply: count intersections with own neighbors
+    // scatter: activated by edge changes only (no iteration cascade)
+    // Paper notes: "incremental computations are simple... involves just updating a count"
+}
+```
+
+#### 4.7.7 Co-Training Expectation Maximization (CoEM)
+
+```java
+public final class CoTrainingEM implements VertexProgram<double[], Double, double[]> {
+    // Paper uses "the Latent Dirichlet Allocation (LDA) implementation
+    // in GraphX which uses EM"
+    // Implements EM update rules on factor graph
+}
+```
+
+#### 4.7.8 Breadth-First Search (BFS)
+
+```java
+public final class BreadthFirstSearch implements VertexProgram<Integer, Object, Integer> {
+    private final long sourceVertex;
+    // gather: min(neighbor_distance + 1)
+    // apply: update distance
+    // scatter: activate unvisited neighbors
+    // Paper notes: "light weight... only a very small part of the graph to be active"
+}
+```
+
+#### 4.7.9 k-Hop
+
+```java
+public final class KHop implements VertexProgram<Set<Long>, Object, Set<Long>> {
+    private final long sourceVertex;
+    private final int k;
+    // Compute all vertices within k hops of source
+    // gather: collect hop sets from neighbors
+    // apply: union with own set
+    // scatter: propagate if set changed and within k hops
+    // Paper evaluation uses k=4
+}
+```
+
+---
+
+### 4.8 tegra-benchmark: Evaluation Harness
+
+**Paper reference**: §7
+
+The benchmark module reproduces the evaluation from the paper.
+
+#### 4.8.1 Datasets
+
+The paper uses (Table 2):
+- **Twitter**: 41.6M vertices / 1.47B edges
+- **UK-2007**: 105.9M vertices / 3.74B edges
+- **Synthetic (Facebook)**: Varies / 5B, 10B, 50B edges
+
+For testing: SNAP datasets (smaller Twitter/LiveJournal subsets) and synthetic R-MAT power-law graphs.
+
+```java
+public interface DatasetLoader {
+    GraphSource load(String datasetName, Path dataPath);
+}
+
+public final class SnapDatasetLoader implements DatasetLoader { ... }
+public final class RmatGraphGenerator implements DatasetLoader {
+    // R-MAT power-law graph generator
+    // Parameters: scale, edgeFactor, a=0.57, b=0.19, c=0.19, d=0.05
+}
+```
+
+#### 4.8.2 Workload Generation
+
+The paper simulates temporal evolution: *"start with 80% of edges and add 1% per snapshot"* (§7.3), and for ad-hoc analysis: *"each update modifies 0.1% of the edges (adds and removes equal number)"* (§7.2).
+
+```java
+public final class WorkloadGenerator {
+    /**
+     * Generate a sequence of graph mutations simulating temporal evolution.
+     */
+    public List<List<GraphMutation>> generateEvolution(
+        GraphView baseGraph,
+        double mutationRate,    // e.g., 0.01 for 1%
+        int numSnapshots,
+        MutationType type       // ADDITIONS_ONLY, EQUAL_ADD_REMOVE, etc.
+    );
+}
+```
+
+#### 4.8.3 Experiments
+
+Reproducing the paper's experiments:
+
+| Experiment | Paper Section | Measures |
+|-----------|--------------|----------|
+| Snapshot retrieval latency | §7.1, Table 3 | Avg latency for 10 random retrievals with 200-1000 snapshots |
+| Computation state storage | §7.1, Figure 7 | Memory usage after 200-1000 incremental computations |
+| Ad-hoc single snapshot | §7.2, Figure 8 | Avg query time on 100 random single-snapshot windows |
+| Ad-hoc window (size 10) | §7.2, Figure 9 | Avg query time on 100 random windows of 10 snapshots |
+| Large graphs | §7.2, Table 4 | PR/CC/BP on 5B, 10B, 50B edge graphs |
+| Batch size effect | §7.2, Table 5 | Performance with 1K, 10K, 100K batch sizes |
+| Parallel snapshots | §7.3, Figure 10 | Temporal query on 2-20 snapshots, CC algorithm |
+| Switching capability | §7.3, Figure 11 | ICE with/without switching after targeted deletions |
+| Monotonic updates | §7.3, Figure 12 | ICE with additions-only vs full incremental |
+| State sharing | §7.3, Figure 13 | Memory/runtime with/without state sharing between CC and PR |
+| Streaming analysis | §7.4, Figure 14 | Online CC with continuous small updates |
+| Temporal analysis | §7.4, Figure 15 | Purely temporal window-10 query vs Chlonos-style |
+
+```java
+public final class BenchmarkRunner {
+    public void runAll(BenchmarkConfig config);
+    public BenchmarkResult runExperiment(String experimentName, BenchmarkConfig config);
+    public void exportResults(Path outputDir);  // CSV + summary
+}
+```
+
+#### 4.8.4 Metrics Collection
+
+```java
+public final class MetricsCollector {
+    public void recordLatency(String operation, long nanos);
+    public void recordMemory(String label, long bytes);
+    public void recordThroughput(String operation, long count, long nanos);
+    public MetricsSnapshot snapshot();
+}
+```
+
+---
+
+## 5. Java 21 Platform Mapping
+
+### 5.1 Virtual Threads (Project Loom)
+
+Tegra naturally benefits from virtual threads in several places:
+
+| Use Case | Paper Basis | Java 21 Mechanism |
+|----------|-------------|-------------------|
+| Parallel snapshot queries | §3.1, Figure 10 | `Executors.newVirtualThreadPerTaskExecutor()` |
+| LRU eviction background thread | §5.4 | `Thread.ofVirtual().start()` |
+| Orphan cleanup | §5.4 | `Thread.ofVirtual().start()` |
+| Distributed GAS message handling | §6 | Virtual thread per incoming RPC |
+| Barrier coordination | §5.2 | Virtual thread per partition coordinator |
+
+Virtual threads are ideal because Tegra's workloads are I/O-mixed (disk reads for evicted snapshots, network for distributed GAS). Virtual threads avoid the overhead of platform thread pools while enabling simple blocking I/O code.
+
+### 5.2 Records and Sealed Interfaces
+
+Java 21 records provide immutable, value-based semantics perfect for Tegra's data model:
+
+- `VertexData`, `EdgeData`, `EdgeKey`, `EdgeTriplet` — immutable graph entities
+- `ByteArray`, `DiskPointer`, `NodeDescriptor` — system identifiers
+- `Delta`, `IterationMetrics`, `GraphCharacteristics`, `TrainingRecord` — computation data
+- `PropertyValue` subtypes — tagged union for property values
+
+Sealed interfaces provide exhaustive pattern matching for node types:
+
+```java
+public sealed interface ArtNode<V>
+    permits Node4, Node16, Node48, Node256, Leaf, DiskNode {}
+
+// Pattern matching in traversal:
+switch (node) {
+    case Node4<V> n4 -> handleNode4(n4);
+    case Node16<V> n16 -> handleNode16(n16);
+    case Node48<V> n48 -> handleNode48(n48);
+    case Node256<V> n256 -> handleNode256(n256);
+    case Leaf<V> leaf -> handleLeaf(leaf);
+    case DiskNode<V> disk -> handleDisk(disk);
+}
+```
+
+### 5.3 Foreign Memory API (Panama)
+
+The Foreign Function & Memory API (`java.lang.foreign`) in Java 21 enables off-heap memory management, critical for Tegra's tree nodes to avoid GC pressure.
+
+**Use cases**:
+
+1. **ART node storage**: Allocate Node4/16/48/256 structures off-heap using `Arena` and `MemorySegment`. This avoids GC scanning of the large persistent tree structures.
+
+2. **Bulk allocation during path-copying**: Use `Arena.ofConfined()` for transient nodes during branch-commit windows. All transient allocations are freed together when the arena is closed.
+
+3. **Memory-mapped disk access**: Use `MemorySegment.mapFile()` for zero-copy access to evicted subtrees.
+
+```java
+// Example: Off-heap Node256 layout
+public final class OffHeapNode256<V> implements ArtNode<V> {
+    private static final MemoryLayout LAYOUT = MemoryLayout.structLayout(
+        ValueLayout.JAVA_INT.withName("refCount"),
+        ValueLayout.JAVA_INT.withName("prefixLen"),
+        MemoryLayout.sequenceLayout(8, ValueLayout.JAVA_BYTE).withName("prefix"),
+        ValueLayout.JAVA_SHORT.withName("numChildren"),
+        MemoryLayout.sequenceLayout(256, ValueLayout.ADDRESS).withName("children")
+    );
+
+    private final MemorySegment segment;
+    // ...
+}
+```
+
+Note: Off-heap node storage is an optimization path. The initial implementation should use standard Java objects, with off-heap as a configurable option for production workloads requiring predictable GC behavior.
+
+### 5.4 Structured Concurrency
+
+Java 21's structured concurrency (preview) is a natural fit for parallel snapshot computation:
+
+```java
+// Parallel computation across snapshots (§3.1)
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    List<Subtask<Snapshot>> tasks = snapshots.stream()
+        .map(s -> scope.fork(() -> iceEngine.compute(s, program)))
+        .toList();
+    scope.join().throwIfFailed();
+    return tasks.stream().collect(toMap(
+        t -> t.get().id(),
+        Subtask::get
+    ));
+}
+```
+
+### 5.5 Concurrency Utilities
+
+- `StampedLock` for version map access (optimistic reads for retrieval, write lock for commit).
+- `VarHandle` for atomic refCount operations on ART nodes.
+- `ConcurrentHashMap` for version map and shared state registry.
+- `ReentrantReadWriteLock` for coordinated barrier operations.
+
+---
+
+## 6. Build System & Project Layout
+
+### 6.1 Gradle Configuration
+
+Root `settings.gradle.kts`:
+
+```kotlin
+rootProject.name = "tegra-j"
+
+include(
+    "tegra-pds",
+    "tegra-serde",
+    "tegra-store",
+    "tegra-api",
+    "tegra-compute",
+    "tegra-cluster",
+    "tegra-algorithms",
+    "tegra-benchmark",
+    "tegra-examples"
+)
+```
+
+Root `build.gradle.kts`:
+
+```kotlin
+plugins {
+    java
+    `java-library`
+    `maven-publish`
+    id("com.diffplug.spotless") version "6.25.0"
+}
+
+subprojects {
+    apply(plugin = "java-library")
+    apply(plugin = "maven-publish")
+
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(21))
         }
-    }
-}
-```
-
-When a snapshot is created via path-copying:
-- The **new** nodes (on the copied path) start with refCount = 1
-- The **shared** nodes (not on the path) get `retain()` called (refCount increases)
-
-When a snapshot is evicted:
-- Walk the tree from its root, calling `release()` on each node
-- Nodes with refCount > 1 are shared with other versions — they survive
-- Nodes reaching refCount = 0 are immediately freed
-
-### 13.3 Batch Commit Arena
-
-During a `commit()` with many mutations, we use a dedicated arena for path-copied nodes:
-
-```java
-public SnapshotId commit(MutableGraphView<V, E> working) {
-    try (var commitArena = new OffHeapArena(estimatedCommitSize())) {
-        // All path-copied nodes go into this arena
-        // Arena provides sequential allocation (cache-friendly)
-        // Arena tracks all allocations for bulk reference management
-        var newRoot = working.finalize(commitArena);
-        versions.put(id, newRoot);
-    }
-    // commitArena.close() does NOT free memory —
-    // it transfers ownership to the version map
-}
-```
-
-### 13.4 JVM Tuning Recommendations
-
-```bash
-# Recommended JVM flags for Tegra-J
-java \
-  -XX:+UseZGC \                          # Sub-ms pauses
-  -XX:+ZGenerational \                   # Generational ZGC (Java 21+)
-  -Xmx8g \                              # Modest heap (most data is off-heap)
-  -XX:MaxDirectMemorySize=64g \          # Off-heap budget for tree nodes
-  --enable-preview \                     # For structured concurrency, scoped values
-  --add-modules jdk.incubator.vector \   # For SIMD in ART Node16 key search
-  -jar tegra-j.jar
-```
-
----
-
-## 14. Java 21 Feature Utilization Map
-
-| Java 21 Feature | Where Used | How |
-|-----------------|-----------|-----|
-| **Records (JEP 395)** | `SnapshotId`, `VertexId`, `EdgeId`, `GraphDelta`, `DiffEntry`, `VersionRoot`, `PathCopyResult`, `EvictionMetadata` | Immutable value types with structural equality. Reduces boilerplate by ~60% |
-| **Sealed Interfaces (JEP 409)** | `ArtNode`, `HamtNode`, `GraphView`, `Partitioner`, `ChangeType` | Exhaustive type hierarchies enabling pattern-match dispatch without `instanceof` chains |
-| **Pattern Matching for switch (JEP 441)** | Tree traversal in `PersistentART`, `PersistentHAMT`, diff algorithm, serialization | `case Node4 n4 -> ...` replaces visitor pattern. JIT can optimize as a tableswitch |
-| **Virtual Threads (JEP 444)** | RPC handlers, distributed GAS phases, parallel snapshot operations, Timelapse.map() | One virtual thread per partition per superstep. Millions concurrent. No thread pool tuning |
-| **Structured Concurrency (JEP 462)** | Distributed commit barrier, parallel diff computation, Timelapse.map() | Fork-join with cancellation. Failure in one partition cancels all |
-| **Scoped Values (JEP 446)** | Snapshot context in GAS computation, current MutationContext, trace IDs | Thread-local-like but immutable and virtual-thread-friendly |
-| **Foreign Memory API (JEP 454)** | Off-heap tree nodes, memory-mapped snapshot files, zero-copy serialization | `Arena`, `MemorySegment`, `MemoryLayout` for tree node allocation |
-| **Vector API (JEP 448)** | ART Node16 key search (SIMD comparison), batch hash computation | 16-byte key comparison in one instruction on x86 AVX2 |
-| **Sequenced Collections (JEP 431)** | Timelapse snapshot ordering, iteration state sequences | `SequencedMap` for version map with first/last access |
-
----
-
-## 15. API Design — The Public Contract
-
-### 15.1 Builder Pattern Entry Point
-
-```java
-// Create a new timelapse for a graph
-Timelapse<UserProfile, FollowEdge> twitter = Timelapse.builder("twitter")
-    .vertexType(UserProfile.class)
-    .edgeType(FollowEdge.class)
-    .storageDir(Path.of("/data/tegra/twitter"))
-    .maxInMemorySnapshots(500)
-    .evictionPolicy(EvictionPolicy.lru())
-    .build();
-
-// Load initial graph
-twitter.ingest(GraphLoader.fromEdgeList(Path.of("twitter.edges")));
-twitter.save("TWTR_1577869200");
-
-// Apply mutations and create new snapshot
-var working = twitter.branch("TWTR_1577869200");
-working.addEdge(42L, 99L, new FollowEdge(Instant.now()));
-working.removeEdge(13L, 7L);
-twitter.save(working, "TWTR_1577872800");
-
-// Ad-hoc query on any snapshot
-double[] ranks = twitter.run("TWTR_1577869200",
-    new PageRank<>(0.85, 1e-6, 20));
-
-// Incremental query across multiple snapshots
-var snapshots = twitter.range("TWTR_1577869200", "TWTR_1577872800");
-Map<SnapshotId, double[]> allRanks = twitter.mapIncremental(
-    snapshots.stream().map(GraphSnapshot::id).toList(),
-    new PageRank<>(0.85, 1e-6, 20));
-
-// What-if analysis
-var whatIf = twitter.branch("TWTR_1577869200");
-whatIf.removeVertex(42L);  // What if user 42 left?
-twitter.save(whatIf, "TWTR_WHATIF_NO42");
-double[] altRanks = twitter.run("TWTR_WHATIF_NO42",
-    new PageRank<>(0.85, 1e-6, 20));
-
-// Compare
-GraphDelta<UserProfile, FollowEdge> delta =
-    twitter.diff("TWTR_1577869200", "TWTR_1577872800");
-System.out.println("Changed vertices: " + delta.changedVertexIds().size());
-```
-
-### 15.2 Algorithm SPI
-
-Users can implement custom algorithms:
-
-```java
-public final class MyCustomAlgorithm
-    implements VertexProgram<MyVertexValue, MyEdgeValue, MyMessage> {
-
-    // Implement gather, sum, apply, scatter...
-}
-
-// Register via ServiceLoader or direct instantiation
-var result = timelapse.run(snapshotId, new MyCustomAlgorithm());
-```
-
-### 15.3 Fluent Query API
-
-```java
-// Temporal comparison
-var comparison = timelapse.compare()
-    .snapshot("TWTR_1577869200")
-    .snapshot("TWTR_1577872800")
-    .using(new ConnectedComponents<>())
-    .execute();
-
-int componentsBefore = comparison.get("TWTR_1577869200").componentCount();
-int componentsAfter = comparison.get("TWTR_1577872800").componentCount();
-
-// Sliding window
-var results = timelapse.window()
-    .from("TWTR_1577869200")
-    .to("TWTR_1577908800")
-    .stride(Duration.ofHours(1))
-    .algorithm(new PageRank<>(0.85, 1e-6, 20))
-    .execute();
-```
-
----
-
-## 16. Integration Points & Ecosystem
-
-### 16.1 Apache TinkerPop Compatibility
-
-Tegra-J can implement the TinkerPop `Graph` interface, enabling Gremlin query language support:
-
-```java
-// tegra-tinkerpop module (optional)
-public final class TegraGraph implements Graph {
-    private final Timelapse<?, ?> timelapse;
-    private final SnapshotId activeSnapshot;
-
-    @Override
-    public Vertex addVertex(Object... keyValues) { /* ... */ }
-
-    @Override
-    public Iterator<Vertex> vertices(Object... vertexIds) { /* ... */ }
-
-    // Gremlin traversals work on any snapshot
-    public TegraGraph atSnapshot(SnapshotId id) { /* ... */ }
-}
-```
-
-### 16.2 Apache Arrow Integration
-
-For interop with Python (pandas, NetworkX) and analytics tools:
-
-```java
-// Export a snapshot as Arrow RecordBatches
-var vertexBatch = ArrowBridge.verticesToArrow(snapshot, allocator);
-var edgeBatch = ArrowBridge.edgesToArrow(snapshot, allocator);
-
-// Zero-copy sharing via Arrow IPC
-ArrowFileWriter.write(vertexBatch, channel);
-```
-
-### 16.3 Apache Kafka / Flink Ingestion
-
-```java
-// Ingest graph mutations from Kafka
-var ingester = KafkaGraphIngester.builder()
-    .topic("graph-mutations")
-    .bootstrapServers("kafka:9092")
-    .timelapse(timelapse)
-    .batchSize(10_000)         // Commit snapshot every 10K mutations
-    .build();
-
-ingester.start(); // Runs on virtual threads
-```
-
-### 16.4 REST API (Optional tegra-server module)
-
-```
-GET  /api/v1/timelapse/{graphId}/snapshots
-GET  /api/v1/timelapse/{graphId}/snapshots/{snapshotId}
-POST /api/v1/timelapse/{graphId}/snapshots/{snapshotId}/query
-     Body: {"algorithm": "pagerank", "params": {"damping": 0.85}}
-GET  /api/v1/timelapse/{graphId}/diff/{snapA}/{snapB}
-POST /api/v1/timelapse/{graphId}/branch/{snapshotId}
-```
-
----
-
-## 17. Testing Strategy
-
-### 17.1 Test Pyramid
-
-```
-                    ┌───────────────┐
-                    │   End-to-End  │  tegra-benchmark (JMH)
-                    │   Benchmarks  │  Real datasets (Twitter, UK)
-                    └───────┬───────┘
-                   ┌────────┴────────┐
-                   │  Integration    │  Multi-module, distributed commit,
-                   │  Tests          │  ICE end-to-end, eviction round-trip
-                   └────────┬────────┘
-              ┌─────────────┴─────────────┐
-              │  Component Tests           │  Per-module: DGSI ops, GAS engine,
-              │                            │  diff correctness, serialization
-              └─────────────┬─────────────┘
-         ┌──────────────────┴──────────────────┐
-         │  Unit Tests (Property-Based)         │  HAMT/ART invariants, structural
-         │                                      │  sharing verification, diff symmetry
-         └──────────────────────────────────────┘
-```
-
-### 17.2 Critical Correctness Tests
-
-1. **Structural sharing verification**: After path-copying, count shared vs. unique nodes. Verify that shared fraction matches theoretical expectation.
-
-2. **ICE correctness**: For every incremental computation, also run full computation. Assert bit-identical results. This directly verifies the paper's claim that "ICE generates the exact same intermediate states for all edges and vertices at all iterations" (Section 4.2).
-
-3. **Snapshot isolation**: Mutate a branched snapshot. Verify original snapshot is unchanged. Concurrent reads during mutation must see consistent state.
-
-4. **Diff symmetry**: `diff(A, B)` and `diff(B, A)` should produce inverse deltas.
-
-5. **Eviction round-trip**: Evict a snapshot to disk. Reload it. Verify bit-identical to the in-memory version. Run the same algorithm — verify identical results.
-
-6. **Distributed commit consistency**: All partitions must have the same logical snapshot after a barrier commit. Inject failures (partition timeout, network partition) and verify recovery.
-
-### 17.3 Property-Based Testing (jqwik)
-
-```java
-@Property
-void hamtStructuralSharing(
-    @ForAll @Size(min = 100, max = 10000) List<@IntRange(min = 0, max = 100000) Integer> keys,
-    @ForAll @IntRange(min = 0, max = 100) int mutationPercent
-) {
-    var hamt1 = PersistentHAMT.<Integer, String>empty();
-    for (int k : keys) hamt1 = hamt1.put(k, "v" + k);
-
-    int mutations = keys.size() * mutationPercent / 100;
-    var hamt2 = hamt1;
-    for (int i = 0; i < mutations; i++) {
-        hamt2 = hamt2.put(keys.get(i), "modified");
+        modularity.inferModulePath.set(true)
     }
 
-    // Verify: shared node count >= (1 - mutationPercent/100) * totalNodes
-    double sharedFraction = countSharedNodes(hamt1, hamt2) / (double) countNodes(hamt1);
-    assertThat(sharedFraction).isGreaterThan(1.0 - (mutationPercent / 100.0) - 0.1);
-}
+    tasks.withType<JavaCompile> {
+        options.compilerArgs.addAll(listOf(
+            "--enable-preview",
+            "-Xlint:all"
+        ))
+    }
 
-@Property
-void iceCorrectnessMatchesFullExecution(
-    @ForAll("smallGraphs") GraphSnapshot<Long, Void> graph,
-    @ForAll @IntRange(min = 1, max = 100) int edgeMutations
-) {
-    // Full execution
-    var fullResult = gasEngine.execute(graph, new ConnectedComponents<>(), 100, null);
+    tasks.withType<Test> {
+        useJUnitPlatform()
+        jvmArgs("--enable-preview")
+    }
 
-    // Incremental execution
-    var mutated = applyRandomMutations(graph, edgeMutations);
-    var iceResult = iceEngine.executeIncremental(mutated,
-        new ConnectedComponents<>(), previousStates, SwitchOracle.never());
-
-    // Must be identical
-    assertGraphValuesEqual(fullResult, iceResult);
+    group = "org.tegra"
+    version = "0.1.0-SNAPSHOT"
 }
 ```
 
----
+### 6.2 External Dependencies (Minimal)
 
-## 18. Benchmarking & Evaluation Plan
+To keep the core lightweight and suitable for OSS:
 
-### 18.1 Microbenchmarks (JMH)
+| Dependency | Module | Purpose |
+|-----------|--------|---------|
+| JUnit 5 | all (test) | Testing |
+| JMH | tegra-benchmark | Microbenchmarks |
+| SLF4J + Logback | all | Logging |
+| JCTools | tegra-pds, tegra-store | Lock-free concurrent data structures |
+| (none for ML) | tegra-compute | Random forest: self-contained implementation |
 
-| Benchmark | What it measures | Target |
-|-----------|-----------------|--------|
-| HAMT.put | Single-key insertion throughput | > 5M ops/sec |
-| HAMT.get | Single-key lookup throughput | > 20M ops/sec |
-| HAMT.pathCopy | Path-copy depth and allocation | O(7) nodes for 1B entries |
-| HAMT.diff | Diff throughput (two 1M-entry tries, 1% changed) | < 10ms |
-| ART.put/get | Same as HAMT but for ART | ART should be 2-3x faster on range scans |
-| SnapshotCommit | End-to-end commit with 10K mutations | < 100ms |
-| SnapshotRetrieve | Retrieval of a random snapshot from 1000 stored | < 2s (match paper) |
-| GAS.pagerank | Single iteration of PageRank on 1M vertex graph | < 500ms |
-| ICE.incremental | Incremental PR on 0.1% changed graph | < 50ms |
+No framework dependencies (no Spring, no Netty for core). Network transport uses Java NIO directly with virtual threads.
 
-### 18.2 Macro Benchmarks (Reproduce Paper Results)
-
-Following the paper's evaluation methodology (Section 7):
-
-1. **Dataset**: Twitter (41.6M V, 1.47B E), UK-2007 (105.9M V, 3.74B E)
-   - Available from SNAP and WebGraph
-   - Simulate evolution: start with 80% edges, add 1% per snapshot
-
-2. **Snapshot retrieval latency** (Table 3): Store 200-1000 snapshots. Measure average of 10 random retrievals. Compare against our baseline (full materialization).
-
-3. **Computation state overhead** (Figure 7): Run PR and CC incrementally, measure memory after every 200 computations up to 1000.
-
-4. **Ad-hoc window operations** (Figures 8-9): 100 random windows, 0.1% change rate. Measure single-snapshot and 10-snapshot window query times.
-
-5. **Timelapse parallel speedup** (Figure 10): CC on 1-20 snapshots. Measure total time vs. serial baseline.
-
-6. **ICE switching** (Figure 11): CC with targeted high-impact deletions. Compare with/without switch oracle.
-
-### 18.3 Comparison Baselines
-
-For an OSS project, compare against:
-- **JGraphT** (single-node, no versioning, no incremental — strawman baseline)
-- **Apache Giraph** (distributed, no versioning)
-- **Neo4j** (property graph store, no computational model)
-- **Naive copy-on-write** (full graph copy per snapshot)
-
----
-
-## 19. Phased Implementation Roadmap
-
-### Phase 0: Project Bootstrap (Week 1)
-
-- [ ] Maven multi-module project setup with JPMS
-- [ ] CI/CD pipeline (GitHub Actions: build, test, benchmark)
-- [ ] Code style (Google Java Format), static analysis (Error Prone, SpotBugs)
-- [ ] CONTRIBUTING.md, CODE_OF_CONDUCT.md, LICENSE (Apache 2.0)
-- [ ] Benchmarking infrastructure (JMH, Gradle benchmark plugin)
-
-### Phase 1: Persistent Data Structures (Weeks 2-4)
-
-- [ ] `PersistentHAMT` with path-copying and transient mutation optimization
-- [ ] Off-heap `OffHeapArena` and `NodeAllocator`
-- [ ] Reference counting for off-heap nodes
-- [ ] `DiffIterator` for efficient structural diff
-- [ ] Property-based test suite (jqwik)
-- [ ] JMH benchmarks for HAMT operations
-- **Milestone**: HAMT passes all correctness tests, demonstrates structural sharing with sublinear memory growth over 1000 versions
-
-### Phase 2: Single-Node DGSI (Weeks 4-6)
-
-- [ ] `GraphPartition` with vertex and edge trees
-- [ ] `VersionMap` with snapshot lifecycle management
-- [ ] `commit()`, `get()`, `branch()`, `diff()` operations
-- [ ] `MutationLog` for inter-snapshot mutation tracking
-- [ ] Basic LRU `EvictionManager`
-- **Milestone**: Can store 100 snapshots of a 1M-vertex graph, retrieve any in < 1s
-
-### Phase 3: Timelapse API (Weeks 6-7)
-
-- [ ] `Timelapse<V,E>` with full API surface
-- [ ] `GraphSnapshot<V,E>` immutable views
-- [ ] `MutableGraphView<V,E>` for branching
-- [ ] `SnapshotId` with prefix/range matching
-- [ ] `TimelapseBuilder` with configuration
-- **Milestone**: Users can create, mutate, commit, branch, and retrieve snapshots via the public API
-
-### Phase 4: GAS Engine (Weeks 7-9)
-
-- [ ] `VertexProgram<V,E,M>` interface
-- [ ] `GasEngine` with gather/apply/scatter loop
-- [ ] `PageRank`, `ConnectedComponents`, `BFS` implementations
-- [ ] Iteration state saving to Timelapse
-- **Milestone**: PageRank runs correctly on a 1M-vertex graph in < 5s for 20 iterations
-
-### Phase 5: ICE Engine (Weeks 9-12)
-
-- [ ] `DiffEngine` using persistent tree referential equality
-- [ ] `NeighborhoodExpander` for 1-hop expansion
-- [ ] `IceEngine` with bootstrap, iteration, termination phases
-- [ ] `StateMerger` for copying unchanged state
-- [ ] `SwitchOracle` (heuristic-based default)
-- [ ] ICE correctness test suite (every incremental result verified against full execution)
-- **Milestone**: ICE achieves 5-10x speedup on 0.1% mutation workloads vs. full recomputation
-
-### Phase 6: Serialization & Eviction (Weeks 12-14)
-
-- [ ] Binary `.tsnap` format for subtree serialization
-- [ ] `MMapSnapshotLoader` for memory-mapped reload
-- [ ] Full tiered eviction pipeline (heap → off-heap → disk)
-- [ ] Eviction round-trip correctness tests
-- **Milestone**: System can store 1000+ snapshots with graceful memory management
-
-### Phase 7: Distribution Layer (Weeks 14-18)
-
-- [ ] `HashPartitioner` for vertex partitioning
-- [ ] `VirtualThreadDispatcher` for RPC
-- [ ] `BarrierCoordinator` for distributed commits
-- [ ] Distributed GAS with cross-partition message passing
-- [ ] Distributed ICE with cross-partition neighborhood expansion
-- **Milestone**: 4-node cluster runs distributed PageRank on partitioned Twitter graph
-
-### Phase 8: Persistent ART (Weeks 18-21)
-
-- [ ] `PersistentART` with Node4/Node16/Node48/Node256
-- [ ] Prefix compression, adaptive node growth/shrink
-- [ ] ART-specific diff optimization
-- [ ] Benchmark: ART vs. HAMT for graph workloads
-- **Milestone**: ART provides 2-3x improvement over HAMT for range-scan-heavy workloads
-
-### Phase 9: Optimizations & Polish (Weeks 21-24)
-
-- [ ] Parallel ICE across multiple snapshots
-- [ ] Sliding window query optimization
-- [ ] Apache Arrow bridge
-- [ ] TinkerPop compatibility layer
-- [ ] Comprehensive documentation and examples
-- [ ] Performance regression test suite
-
-### Phase 10: OSS Launch (Week 24+)
-
-- [ ] Final API review and stabilization
-- [ ] Performance report (reproduce paper results)
-- [ ] Blog post, conference talk
-- [ ] Apache incubator proposal (if pursuing ASF route)
-
----
-
-## 20. OSS Project Governance & Community
-
-### 20.1 Licensing
-
-**Apache License 2.0** — the standard for data infrastructure projects. Allows commercial use, modification, and distribution. Patent grant protects users.
-
-### 20.2 Project Structure (Apache-Style)
+### 6.3 Directory Structure per Module
 
 ```
-Community Roles:
-  PMC Chair      — overall project stewardship
-  PMC Members    — binding votes on releases, new committers
-  Committers     — write access to repository
-  Contributors   — anyone with a merged PR
-
-Decision Making:
-  - Lazy consensus for minor changes
-  - 3 binding +1 votes for releases
-  - Majority PMC vote for new committers
-  - DISCUSS threads for significant design changes
-```
-
-### 20.3 Documentation Strategy
-
-- **User Guide**: Getting started, API reference, configuration, deployment
-- **Developer Guide**: Architecture overview, how to add algorithms, how to implement custom partitioners
-- **Javadoc**: All public API classes with examples
-- **Design Documents**: ADRs (Architecture Decision Records) for major choices
-- **Benchmarks**: Reproducible benchmark suite with published results
-
-### 20.4 Release Strategy
-
-- **Semantic versioning**: MAJOR.MINOR.PATCH
-- **0.x releases**: API unstable, rapid iteration, community feedback
-- **1.0 release**: API stable, backward compatibility guaranteed
-- **Release cadence**: Monthly during 0.x, quarterly after 1.0
-
-### 20.5 CI/CD Pipeline
-
-```yaml
-# GitHub Actions
-on: [push, pull_request]
-jobs:
-  build:
-    matrix:
-      java: [21, 22, 23]      # Test multiple JDK versions
-      os: [ubuntu, macos]
-    steps:
-      - mvn verify              # Unit + integration tests
-      - mvn spotbugs:check      # Static analysis
-      - mvn javadoc:javadoc     # Verify Javadoc compiles
-
-  benchmark:
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - mvn -pl tegra-benchmark jmh:benchmark
-      - publish results to GitHub Pages
-
-  compatibility:
-    steps:
-      - test with ZGC, Shenandoah, G1
-      - test with GraalVM native-image (where applicable)
+tegra-{module}/
+├── build.gradle.kts
+└── src/
+    ├── main/
+    │   ├── java/
+    │   │   └── org/tegra/{module}/
+    │   │       └── *.java
+    │   └── resources/
+    │       └── module-info.java
+    └── test/
+        └── java/
+            └── org/tegra/{module}/
+                └── *Test.java
 ```
 
 ---
 
-## 21. Risk Analysis & Mitigations
+## 7. Testing Strategy
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| **Off-heap memory leaks** (reference counting errors) | Medium | High | Rigorous leak detection in tests; `OffHeapArena` tracks all allocations; periodic integrity checks in debug mode |
-| **GC pressure from vertex properties** (heap-side data) | Medium | Medium | Use primitive specializations (`DoubleVertexStore`, `LongVertexStore`) to avoid boxing. ZGC sub-ms pauses for remainder |
-| **Virtual thread pinning** (synchronized blocks in hot path) | Low | Medium | Use `ReentrantLock` instead of `synchronized` in all concurrent code. Monitor with JFR pinning events |
-| **ART/HAMT performance vs. native** | Medium | Medium | HAMT-first strategy de-risks. If ART perf insufficient, integrate via JNI/Panama FFI to a C library |
-| **Distributed coordination complexity** | High | High | Start single-node. Distribution is opt-in. Simple barrier protocol. Don't try to be Spark |
-| **API instability delaying adoption** | Medium | High | 0.x period with explicit "experimental" labels. Gather feedback before 1.0. Minimalist public API surface |
-| **Scope creep** (trying to also be a streaming engine) | Medium | Medium | Explicit non-goal. Tegra-J is for ad-hoc analytics. Streaming integration via adapters only |
-| **Competitive landscape** (Neo4j, TigerGraph, etc.)** | Medium | Low | Different niche. No existing system does ad-hoc temporal graph analytics with computation reuse |
+### 7.1 Unit Tests
 
----
+Every module has comprehensive unit tests. Key areas:
 
-## Appendix A: Key Data Structure Pseudocode
+**tegra-pds**:
+- ART insert/lookup/delete correctness for all node types.
+- Path-copying: verify old root unchanged after insert.
+- Structural sharing: verify shared nodes have same identity.
+- Node transitions: Node4→16→48→256 and back.
+- Prefix iteration correctness.
+- Range iteration correctness.
+- Reference counting accuracy.
+- Bulk builder correctness.
+- Memory: create 1000 versions with small mutations, verify memory is sublinear (paper §7.1 style).
 
-### A.1 HAMT Insert with Path-Copying
+**tegra-store**:
+- Branch/commit lifecycle.
+- Version map operations (put, get, prefix match, range match).
+- LRU eviction: access patterns, eviction ordering.
+- Disk serialization roundtrip.
+- Orphan cleanup timing.
+- Concurrent read access to shared snapshots.
 
-```
-function insert(node, key, value, hash, shift, ctx):
-    if node is EmptyNode:
-        return new Leaf(key, value)
+**tegra-api**:
+- Timelapse save/retrieve roundtrip.
+- Diff: known graph changes produce expected delta.
+- Diff efficiency: shared subtrees skipped.
+- Expand: 1-hop neighbors correctly identified.
+- Merge: correct vertex resolution.
 
-    if node is Leaf:
-        if node.key == key:
-            return new Leaf(key, value)  // Replace
-        else:
-            return splitLeaf(node, key, value, hash, shift)
+**tegra-compute**:
+- GAS engine convergence on small graphs.
+- ICE correctness: incremental result matches full recomputation.
+- ICE termination conditions.
+- Switching classifier: correct predictions on known data.
+- Parallel snapshot execution: results match serial execution.
 
-    if node is BitmapIndexedNode:
-        bit = bitpos(hash, shift)       // 1 << ((hash >>> shift) & 0x1f)
-        idx = bitcount(bitmap & (bit - 1))
+**tegra-algorithms**:
+- Each algorithm against known results on small graphs.
+- Incremental results match full recomputation after mutations.
 
-        if (bitmap & bit) == 0:
-            // No child at this position — add one
-            newArray = insertAt(node.contents, idx, key, value)
-            newBitmap = bitmap | bit
-            if editable(node, ctx):
-                node.bitmap = newBitmap
-                node.contents = newArray
-                return node             // In-place mutation (transient)
-            else:
-                return new BitmapIndexedNode(newBitmap, newArray)  // Path-copy
-        else:
-            // Child exists — recurse
-            child = node.contents[idx]
-            newChild = insert(child, key, value, hash, shift + 5, ctx)
-            if newChild == child:
-                return node             // No change
-            newArray = replaceAt(node.contents, idx, newChild)
-            if editable(node, ctx):
-                node.contents = newArray
-                return node
-            else:
-                return new BitmapIndexedNode(bitmap, newArray)
-```
+### 7.2 Integration Tests
 
-### A.2 Persistent ART Insert with Path-Copying
+- End-to-end: load graph → create snapshots → run algorithms → verify results.
+- Distributed: multi-partition setup (in-process) with cross-partition edges.
+- Eviction: create many snapshots, trigger eviction, verify retrieval from disk.
+- Concurrent access: multiple virtual threads querying/modifying simultaneously.
 
-```
-function artInsert(node, key, depth, value, ctx):
-    if node is null:
-        return new ArtLeaf(key, value)
+### 7.3 Property-Based Tests
 
-    if node is ArtLeaf:
-        if node.key == key:
-            return new ArtLeaf(key, value)
-        // Create new inner node with two leaves
-        newNode = new Node4()
-        commonPrefix = longestCommonPrefix(node.key, key, depth)
-        newNode.prefix = commonPrefix
-        newNode.addChild(key[depth + commonPrefix.length], new ArtLeaf(key, value))
-        newNode.addChild(node.key[depth + commonPrefix.length], node)
-        return newNode
+- For any sequence of insert/delete operations, the pART always returns correct lookup results.
+- For any two snapshots, diff followed by applying the delta to snapshot A produces snapshot B.
+- ICE on any graph mutation sequence produces the same result as full recomputation.
 
-    if node is InnerNode (Node4/16/48/256):
-        // Check prefix
-        mismatch = prefixMismatch(node.prefix, key, depth)
-        if mismatch < node.prefixLen:
-            // Split prefix
-            newNode = new Node4()
-            newNode.prefix = key[depth..depth+mismatch]
-            newNode.addChild(node.prefix[mismatch], node.shrinkPrefix(mismatch+1))
-            newNode.addChild(key[depth+mismatch], new ArtLeaf(key, value))
-            return newNode
+### 7.4 Performance Tests (JMH)
 
-        depth += node.prefixLen
-        child = node.findChild(key[depth])
-        if child is not null:
-            newChild = artInsert(child, key, depth + 1, value, ctx)
-            return pathCopy(node, key[depth], newChild, ctx)  // Copy this node, replace child
-        else:
-            return pathCopy(node, key[depth], new ArtLeaf(key, value), ctx)  // Copy and add child
-```
+- pART insert/lookup throughput at various tree sizes.
+- Path-copying overhead vs. full-copy baseline.
+- Structural sharing memory savings.
+- GAS iteration throughput.
+- ICE speedup vs. full recomputation at various mutation rates.
 
 ---
 
-## Appendix B: API Surface Draft
+## 8. Fault Tolerance
 
-### B.1 Core Types (tegra-api)
+**Paper reference**: §6
+
+The paper states: *"Spark provides fault tolerance by checkpointing inputs and operations for reconstructing the state. Tegra provides coarse-grained fault tolerance by leveraging Spark's rdd.checkpoint semantics. Users can explicitly run checkpoint operation, upon which Tegra flushes the contents in DGSI to persistent storage."*
+
+And: *"We currently do not support fine-grained lineage-based fault tolerance provided by Spark."*
+
+Our implementation provides the same coarse-grained checkpoint mechanism:
 
 ```java
-// === Value types (records) ===
-record SnapshotId(byte[] raw) implements Comparable<SnapshotId> {}
-record VertexId(long id) {}
-record EdgeId(long src, long dst, short discriminator) {}
-record Vertex<V>(long id, V properties) {}
-record Edge<E>(long src, long dst, E properties) {}
-record GraphDelta<V, E>(
-    List<DiffEntry<Long, V>> vertexChanges,
-    List<DiffEntry<EdgeId, E>> edgeChanges) {}
-record DiffEntry<K, V>(K key, V oldValue, V newValue, ChangeType type) {}
+public final class CheckpointManager {
+    private final DiskStore diskStore;
 
-// === Core interfaces ===
-sealed interface GraphView<V, E> permits GraphSnapshot, MutableGraphView {}
-final class GraphSnapshot<V, E> implements GraphView<V, E> {}  // immutable
-final class MutableGraphView<V, E> implements GraphView<V, E> {}  // mutable
+    /**
+     * Flush all DGSI contents to persistent storage.
+     * User-triggered operation.
+     */
+    public void checkpoint(PartitionStore store);
 
-// === Main entry point ===
-final class Timelapse<V, E> {
-    static <V, E> TimelapseBuilder<V, E> builder(String graphId);
-    SnapshotId save(String id);
-    SnapshotId save(MutableGraphView<V, E> working, String id);
-    GraphSnapshot<V, E> retrieve(SnapshotId id);
-    List<GraphSnapshot<V, E>> retrieve(String prefix);
-    List<GraphSnapshot<V, E>> range(SnapshotId from, SnapshotId to);
-    GraphDelta<V, E> diff(SnapshotId a, SnapshotId b);
-    MutableGraphView<V, E> branch(SnapshotId source);
-    <R> R run(SnapshotId id, GraphAlgorithm<V, E, R> algorithm);
-    <R> Map<SnapshotId, R> map(List<SnapshotId> ids, GraphAlgorithm<V, E, R> algo);
-    <R> Map<SnapshotId, R> mapIncremental(List<SnapshotId> ids, GraphAlgorithm<V, E, R> algo);
-    <R> List<R> window(SnapshotId start, SnapshotId end, Duration stride, GraphAlgorithm<V, E, R> algo);
+    /**
+     * Restore DGSI state from a checkpoint.
+     */
+    public PartitionStore restore(Path checkpointDir);
 }
-
-// === Computation ===
-interface VertexProgram<V, E, M> {
-    EdgeDirection gatherDirection();
-    EdgeDirection scatterDirection();
-    M gather(V vertexValue, E edgeValue, V neighborValue);
-    M sum(M a, M b);
-    V apply(V currentValue, M gathered);
-    boolean scatter(V updatedValue, V oldValue, E edgeValue);
-    M identity();
-}
-
-// === SPI extension points ===
-interface EvictionPolicy {}
-interface Partitioner {}
-interface Serializer {}
-interface ComputeEngine {}
-interface SwitchOracle {}
 ```
 
-### B.2 Module Exports
-
-| Module | Exports | Opens |
-|--------|---------|-------|
-| `org.tegra.api` | `org.tegra.api`, `org.tegra.api.config` | — |
-| `org.tegra.pds` | `org.tegra.pds.art`, `org.tegra.pds.hamt`, `org.tegra.pds.common` | — |
-| `org.tegra.store` | `org.tegra.store` (to `org.tegra.api` only) | — |
-| `org.tegra.compute` | `org.tegra.compute.gas`, `org.tegra.compute.spi` | — |
-| `org.tegra.algorithms` | `org.tegra.algorithms` | — |
-| `org.tegra.serde` | `org.tegra.serde` (to `org.tegra.store` only) | — |
-| `org.tegra.cluster` | `org.tegra.cluster` | — |
+Fine-grained lineage-based fault tolerance is explicitly out of scope per the paper.
 
 ---
 
-## Appendix C: Comparison with Existing Java Graph Libraries
+## 9. OSS Release Plan
 
-| Feature | **Tegra-J** | JGraphT | Apache Giraph | Neo4j | TinkerPop |
-|---------|-----------|---------|---------------|-------|-----------|
-| **Temporal versioning** | Native (DGSI) | No | No | No (manual snapshots) | No |
-| **Structural sharing** | Persistent ART/HAMT | No | No | No | No |
-| **Incremental computation** | ICE | No | No | No | No |
-| **Ad-hoc window queries** | Native | No | No | Manual | No |
-| **Property graph** | Yes | Yes | Yes | Yes | Yes |
-| **Distributed** | Yes (opt-in) | No | Yes (Hadoop) | Cluster (enterprise) | Varies |
-| **GAS model** | Native | No | Yes | No | Via OLAP |
-| **In-memory** | Yes (off-heap) | Yes (heap) | No (disk-based) | Hybrid | Varies |
-| **Algorithm library** | Growing | Extensive | Limited | Procedures | Varies |
-| **License** | Apache 2.0 | LGPL/EPL | Apache 2.0 | GPL/Commercial | Apache 2.0 |
+### 9.1 License
 
-**Key differentiator**: No existing Java library combines temporal versioning, structural sharing, and incremental computation. Tegra-J occupies a unique niche.
+Apache License 2.0 — standard for Apache Foundation projects, permissive, patent-grant included.
+
+### 9.2 Project Metadata
+
+- **Group ID**: `org.tegra`
+- **Artifact prefix**: `tegra-`
+- **Minimum Java**: 21
+- **SCM**: GitHub
+- **CI**: GitHub Actions (build + test on JDK 21, 22)
+- **Code style**: Google Java Style (enforced via Spotless)
+- **Static analysis**: Error Prone, SpotBugs
+
+### 9.3 API Stability
+
+- Public APIs in `tegra-api` and `tegra-algorithms` are the user-facing contracts.
+- Internal modules (`tegra-pds`, `tegra-store`, `tegra-serde`) are exported only to other Tegra modules via JPMS `exports ... to` directives.
+- SPI interfaces (`GraphImporter`, `PartitionStrategy`, `VertexProgram`) are stable extension points.
+- Versioning follows SemVer.
+
+### 9.4 Documentation
+
+- Javadoc on all public APIs.
+- Architecture guide (this document, condensed).
+- Getting started guide with examples.
+- Benchmark reproduction guide.
+
+### 9.5 Release Artifacts
+
+Published to Maven Central:
+- `tegra-api` — for algorithm developers
+- `tegra-algorithms` — standard algorithms
+- `tegra-cluster` — for distributed deployments
+- `tegra-benchmark` — for reproducibility
 
 ---
 
-## Appendix D: Glossary
+## 10. Implementation Phases
 
-| Term | Definition |
-|------|-----------|
-| **Persistent Data Structure** | A data structure that preserves previous versions when modified; modifications create new versions sharing structure with old ones |
-| **Path-Copying** | The technique of creating a new version by copying only the nodes on the path from root to the modified leaf |
-| **Structural Sharing** | The property that two versions of a persistent data structure share unchanged subtrees |
-| **HAMT** | Hash Array Mapped Trie — a persistent hash table using bitmap-indexed trie nodes |
-| **ART** | Adaptive Radix Tree — a radix tree with nodes that adapt their size (4, 16, 48, 256 children) based on density |
-| **GAS** | Gather-Apply-Scatter — a vertex-centric programming model for graph-parallel computation |
-| **ICE** | Incremental Computation by Entity Expansion — Tegra's technique for avoiding redundant computation |
-| **DGSI** | Distributed Graph Snapshot Index — Tegra's versioned graph store |
-| **Timelapse** | The user-facing abstraction: a sequence of immutable graph snapshots |
-| **Snapshot** | An immutable, point-in-time view of the entire graph |
-| **Virtual Thread** | A lightweight thread managed by the JVM, not the OS; can block without consuming an OS thread |
-| **Arena** | A memory allocation scope from Java's Foreign Memory API; manages off-heap memory lifecycle |
+### Phase 1: Core Storage (tegra-pds + tegra-serde + tegra-store)
+
+**Goal**: Single-node persistent graph store with versioning.
+
+1. Implement persistent ART with all four node types, path-copying, reference counting, and path compression.
+2. Implement binary serialization for ART nodes and graph data.
+3. Build the graph data model (vertex pART + edge pART) on top of pART.
+4. Implement version management: branch, commit, retrieve, version ID matching.
+5. Implement diff operation exploiting structural sharing.
+6. Implement LRU eviction with disk serialization.
+7. Implement mutation log.
+
+**Validation**: Create 1000 snapshots with 1% edge mutations, verify sublinear memory. Verify diff correctness and structural sharing.
+
+### Phase 2: Timelapse API (tegra-api)
+
+**Goal**: User-facing abstraction layer.
+
+1. Implement Timelapse: save, retrieve, diff, expand, merge.
+2. Implement TimelapseManager for timelapse lifecycle.
+3. Implement snapshot-aware graph operators.
+4. Implement VersionIdGenerator for automatic ID schemes.
+
+**Validation**: End-to-end test: create graph → save snapshots → retrieve → diff → expand → merge.
+
+### Phase 3: Graph Computation (tegra-compute + tegra-algorithms)
+
+**Goal**: GAS engine and ICE incremental computation.
+
+1. Implement GAS engine with full execution on single snapshots.
+2. Implement all 9 algorithms as VertexProgram implementations.
+3. Verify correctness on small known graphs.
+4. Implement ICE: bootstrap, iterations, termination.
+5. Implement parallel snapshot execution.
+6. Implement shared state registry.
+7. Implement monotonic update shortcut.
+8. Implement learning-based switching classifier.
+
+**Validation**: For each algorithm, verify ICE result matches full recomputation on 100 random mutation sequences. Verify parallel execution matches serial.
+
+### Phase 4: Distribution (tegra-cluster)
+
+**Goal**: Multi-node distributed execution.
+
+1. Implement partition strategies (hash, 2D, random vertex cut).
+2. Implement network transport (Java NIO + virtual threads).
+3. Implement distributed GAS with cross-partition messaging.
+4. Implement barrier snapshot protocol.
+5. Implement distributed ICE with cross-partition expansion.
+6. Implement update ingestion routing.
+
+**Validation**: Multi-partition in-process tests. Distributed integration tests with multiple JVM processes.
+
+### Phase 5: Benchmarking (tegra-benchmark)
+
+**Goal**: Reproduce paper evaluation results.
+
+1. Implement dataset loaders (SNAP, R-MAT generator).
+2. Implement workload generator (temporal evolution, ad-hoc queries).
+3. Implement all experiments from §7.
+4. Produce comparison metrics against baseline (full recomputation).
+
+### Phase 6: Hardening & Release
+
+1. Performance profiling and optimization.
+2. Stress testing (large graphs, many snapshots, high concurrency).
+3. Documentation.
+4. CI/CD pipeline.
+5. Maven Central publication.
 
 ---
 
-*This research document was produced on 2026-03-14 based on analysis of the Tegra NSDI 2021 paper and implementation guide. It represents a comprehensive blueprint for building Tegra-J as a production-quality, Apache-grade open-source project in Java 21.*
+## 11. Risk Analysis
+
+### 11.1 GC Pressure from Path-Copying
+
+**Risk**: High allocation rate during bulk mutations creates GC pauses.
+**Mitigation**: In-place updates during branch-commit (paper §5.4). Object pooling. Optional off-heap storage via Foreign Memory API. Bulk builder for initial load.
+
+### 11.2 Cross-Partition ICE Cascade
+
+**Risk**: Neighborhood expansion in ICE crosses partition boundaries, causing cascading expansion.
+**Mitigation**: The paper notes this is a known concern. Expansion is limited to 1-hop neighbors per iteration. Multi-hop propagation happens across iterations, naturally bounded by convergence.
+
+### 11.3 Memory Fragmentation
+
+**Risk**: Many small ART node allocations fragment the heap.
+**Mitigation**: Arena allocators for transient nodes. Object pooling with size classes matching Node4/16/48/256. G1GC or ZGC for low-pause collection.
+
+### 11.4 Snapshot Consistency in Distribution
+
+**Risk**: Stragglers delay the barrier commit protocol.
+**Mitigation**: Configurable timeout on barrier wait. The paper uses a "lightweight barrier" — we implement it with a simple two-phase protocol (prepare + commit) with timeout and rollback on failure.
+
+### 11.5 Disk Eviction Latency
+
+**Risk**: Accessing an evicted snapshot causes latency spike.
+**Mitigation**: Lazy materialization (only load accessed subtrees). Memory-mapped files for fast access. Prefetching heuristics for likely-accessed snapshots.
+
+### 11.6 Random Forest Model Portability
+
+**Risk**: The switching classifier trained on one graph/algorithm may not generalize.
+**Mitigation**: The paper includes graph-specific features (degree, diameter, clustering coefficient) in the model. Per-graph model training is supported. Fallback to full recomputation if model is unavailable.
